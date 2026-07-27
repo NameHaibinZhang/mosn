@@ -21,33 +21,53 @@ import (
 	"context"
 
 	"mosn.io/api"
-	"mosn.io/mosn/pkg/protocol"
 	"mosn.io/mosn/pkg/stream"
 	"mosn.io/mosn/pkg/types"
 )
 
-func init() {
-	stream.Register(protocol.Xprotocol, &streamConnFactory{})
+type streamConnFactory struct {
+	name    api.ProtocolName
+	matcher api.ProtocolMatch
+	factory func(ctx context.Context) api.XProtocol
 }
 
-type streamConnFactory struct{}
+func NewStreamFactory(codec api.XProtocolCodec) types.ProtocolStreamFactory {
+	return &streamConnFactory{
+		name:    codec.ProtocolName(),
+		matcher: codec.ProtocolMatch(),
+		factory: codec.NewXProtocol,
+	}
+}
 
 func (f *streamConnFactory) CreateClientStream(context context.Context, connection types.ClientConnection,
 	clientCallbacks types.StreamConnectionEventListener, connCallbacks api.ConnectionEventListener) types.ClientStreamConnection {
-	return newStreamConnection(context, connection, clientCallbacks, nil)
+	return f.newStreamConnection(context, connection, clientCallbacks, nil).(types.ClientStreamConnection)
 }
 
 func (f *streamConnFactory) CreateServerStream(context context.Context, connection api.Connection,
 	serverCallbacks types.ServerStreamConnectionEventListener) types.ServerStreamConnection {
-	return newStreamConnection(context, connection, nil, serverCallbacks)
+	return f.newStreamConnection(context, connection, nil, serverCallbacks).(types.ServerStreamConnection)
 }
 
 func (f *streamConnFactory) CreateBiDirectStream(context context.Context, connection types.ClientConnection,
 	clientCallbacks types.StreamConnectionEventListener,
 	serverCallbacks types.ServerStreamConnectionEventListener) types.ClientStreamConnection {
-	return newStreamConnection(context, connection, clientCallbacks, serverCallbacks)
+	return f.newStreamConnection(context, connection, clientCallbacks, serverCallbacks).(types.ClientStreamConnection)
 }
 
 func (f *streamConnFactory) ProtocolMatch(context context.Context, prot string, magic []byte) error {
+	// if matcher is nil, means protocol does not support for multiple protocol mode and auto mode.
+	if f.matcher == nil {
+		return stream.FAILED
+	}
+
+	result := f.matcher(magic)
+	switch result {
+	case api.MatchSuccess:
+		return nil
+	case api.MatchAgain:
+		return stream.EAGAIN
+	}
 	return stream.FAILED
+
 }

@@ -31,7 +31,6 @@ import (
 
 	"golang.org/x/sys/unix"
 	"mosn.io/api"
-	"mosn.io/mosn/pkg/admin/store"
 	"mosn.io/mosn/pkg/log"
 	"mosn.io/mosn/pkg/mtls"
 	"mosn.io/mosn/pkg/types"
@@ -60,8 +59,6 @@ func TransferServer(handler types.ConnectionHandler) {
 			log.DefaultLogger.Errorf("[network] [transfer] [server] transferServer panic %v", r)
 		}
 	}()
-
-	defer store.SetMosnState(store.Running)
 
 	syscall.Unlink(types.TransferConnDomainSocket)
 	l, err := net.Listen("unix", types.TransferConnDomainSocket)
@@ -92,11 +89,8 @@ func TransferServer(handler types.ConnectionHandler) {
 		}
 	}, nil)
 
-	select {
-	case <-time.After(2*TransferTimeout + 2*buffer.ConnReadTimeout + 10*time.Second):
-		log.DefaultLogger.Infof("[network] [transfer] [server] TransferServer exit")
-		return
-	}
+	<-time.After(2*TransferTimeout + 2*types.DefaultConnReadTimeout + 10*time.Second)
+	log.DefaultLogger.Infof("[network] [transfer] [server] TransferServer exit")
 }
 
 // transferHandler is called on recv transfer request
@@ -233,6 +227,11 @@ func transferGetFile(c *connection) (file *os.File, tlsConn *mtls.TLSConn, err e
 		file, err = conn.File()
 		if err != nil {
 			return nil, nil, fmt.Errorf("TCP File failed %v", err)
+		}
+	case *net.UnixConn:
+		file, err = conn.File()
+		if err != nil {
+			return nil, nil, fmt.Errorf("Unix File failed %v", err)
 		}
 	case *mtls.Conn:
 		mtlsConn, ok := conn.Conn.(*net.TCPConn)
@@ -549,7 +548,7 @@ func transferNewConn(conn net.Conn, dataBuf, tlsBuf []byte, handler types.Connec
 	ch := make(chan api.Connection, 1)
 	// new connection
 	utils.GoWithRecover(func() {
-		listener.GetListenerCallbacks().OnAccept(conn, listener.UseOriginalDst(), nil, ch, dataBuf)
+		listener.GetListenerCallbacks().OnAccept(conn, listener.IsOriginalDst(), nil, ch, dataBuf, nil)
 	}, nil)
 
 	select {
@@ -570,20 +569,32 @@ func transferNewConn(conn net.Conn, dataBuf, tlsBuf []byte, handler types.Connec
 }
 
 func transferFindListen(addr net.Addr, handler types.ConnectionHandler) types.Listener {
-	address := addr.(*net.TCPAddr)
-	port := strconv.FormatInt(int64(address.Port), 10)
-	ipv4, _ := net.ResolveTCPAddr("tcp", "0.0.0.0:"+port)
-	ipv6, _ := net.ResolveTCPAddr("tcp", "[::]:"+port)
+	switch address := addr.(type) {
+	case *net.TCPAddr:
+		port := strconv.FormatInt(int64(address.Port), 10)
+		ipv4, _ := net.ResolveTCPAddr("tcp", "0.0.0.0:"+port)
+		ipv6, _ := net.ResolveTCPAddr("tcp", "[::]:"+port)
 
-	var listener types.Listener
-	if listener = handler.FindListenerByAddress(address); listener != nil {
-		return listener
-	} else if listener = handler.FindListenerByAddress(ipv4); listener != nil {
-		return listener
-	} else if listener = handler.FindListenerByAddress(ipv6); listener != nil {
-		return listener
+		var listener types.Listener
+		if listener = handler.FindListenerByAddress(address); listener != nil {
+			return listener
+		}
+		if listener = handler.FindListenerByAddress(ipv4); listener != nil {
+			return listener
+		}
+		if listener = handler.FindListenerByAddress(ipv6); listener != nil {
+			return listener
+		}
+	case *net.UnixAddr:
+		var listener types.Listener
+		if listener = handler.FindListenerByAddress(address); listener != nil {
+			return listener
+		}
+	default:
+		log.DefaultLogger.Errorf("unexpected net.Addr type; expected TCPAddr or UnixAddr, got %T", address)
+		return nil
 	}
 
-	log.DefaultLogger.Errorf("[network] [transfer] Find Listener failed %v", address)
+	log.DefaultLogger.Errorf("[network] [transfer] Find Listener failed %v", addr)
 	return nil
 }

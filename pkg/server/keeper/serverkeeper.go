@@ -18,58 +18,17 @@
 package keeper
 
 import (
-	"io/ioutil"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"runtime/debug"
-	"strconv"
-	"sync"
 	"syscall"
 
-	"mosn.io/mosn/pkg/types"
+	"mosn.io/mosn/pkg/stagemanager"
 	"mosn.io/pkg/log"
 	"mosn.io/pkg/utils"
 )
 
 func init() {
 	catchSignals()
-
-	onProcessExit = append(onProcessExit, func() {
-		if pidFile != "" {
-			os.Remove(pidFile)
-		}
-	})
-}
-
-var (
-	pidFile               string
-	onProcessExit         []func()
-	shutdownCallbacksOnce sync.Once
-	shutdownCallbacks     []func() error
-	signalCallback        = make(map[syscall.Signal][]func())
-)
-
-func SetPid(pid string) {
-	if pid == "" {
-		pidFile = types.MosnPidDefaultFileName
-	} else {
-		if err := os.MkdirAll(filepath.Dir(pid), 0755); err != nil {
-			pidFile = types.MosnPidDefaultFileName
-		} else {
-			pidFile = pid
-		}
-	}
-	writePidFile()
-}
-
-func writePidFile() (err error) {
-	pid := []byte(strconv.Itoa(os.Getpid()) + "\n")
-
-	if err = ioutil.WriteFile(pidFile, pid, 0644); err != nil {
-		log.DefaultLogger.Errorf("write pid file error: %v", err)
-	}
-	return err
 }
 
 func catchSignals() {
@@ -80,113 +39,47 @@ func catchSignals() {
 func catchSignalsCrossPlatform() {
 	utils.GoWithRecover(func() {
 		sigchan := make(chan os.Signal, 1)
-		signal.Notify(sigchan, syscall.SIGTERM, syscall.SIGHUP,
-			syscall.SIGQUIT, syscall.SIGUSR1, syscall.SIGUSR2)
+		signal.Notify(sigchan, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGUSR1)
 
 		for sig := range sigchan {
-			log.DefaultLogger.Debugf("signal %s received!", sig)
-			switch sig {
-			case syscall.SIGQUIT:
-				// quit
-				for _, f := range onProcessExit {
-					f() // only perform important cleanup actions
-				}
-				os.Exit(0)
-			case syscall.SIGTERM:
-				// stop to quit
-				exitCode := ExecuteShutdownCallbacks("SIGTERM")
-				for _, f := range onProcessExit {
-					f() // only perform important cleanup actions
-				}
-				//Stop()
-
-				if cbs, ok := signalCallback[syscall.SIGTERM]; ok {
-					for _, cb := range cbs {
-						cb()
-					}
-				}
-
-				os.Exit(exitCode)
-			case syscall.SIGUSR1:
-				// reopen
-				log.Reopen()
-			case syscall.SIGHUP:
-
-				if cbs, ok := signalCallback[syscall.SIGHUP]; ok {
-					for _, cb := range cbs {
-						cb()
-					}
-				}
-			case syscall.SIGUSR2:
-			}
+			signalHandler(sig)
 		}
 	}, nil)
 }
 
 func catchSignalsPosix() {
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.DefaultLogger.Errorf("panic %v\n%s", r, string(debug.Stack()))
-			}
-		}()
+	utils.GoWithRecover(func() {
 		shutdown := make(chan os.Signal, 1)
 		signal.Notify(shutdown, os.Interrupt)
 
-		for i := 0; true; i++ {
-			<-shutdown
-
-			if i > 0 {
-				for _, f := range onProcessExit {
-					f() // important cleanup actions only
-				}
-				os.Exit(2)
-			}
-
-			// important cleanup actions before shutdown callbacks
-			for _, f := range onProcessExit {
-				f()
-			}
-
-			go func() {
-				defer func() {
-					if r := recover(); r != nil {
-						log.DefaultLogger.Errorf("panic %v\n%s", r, string(debug.Stack()))
-					}
-				}()
-				os.Exit(ExecuteShutdownCallbacks("SIGINT"))
-			}()
-		}
-	}()
+		sig := <-shutdown
+		signalHandler(sig)
+	}, nil)
 }
 
-func ExecuteShutdownCallbacks(signame string) (exitCode int) {
-	shutdownCallbacksOnce.Do(func() {
-		var errs []error
-
-		for _, cb := range shutdownCallbacks {
-			errs = append(errs, cb())
-		}
-
-		if len(errs) > 0 {
-			for _, err := range errs {
-				log.DefaultLogger.Errorf(" %s shutdown: %v", signame, err)
-			}
-			exitCode = 4
-		}
-	})
-
-	return
+func signalHandler(sig os.Signal) {
+	log.DefaultLogger.Infof("signal %s received!", sig)
+	// syscall.SIGQUIT, syscall.SIGINT/os.Interrupt or syscall.SIGTERM:
+	switch sig {
+	case syscall.SIGUSR1:
+		// reopen log
+		log.Reopen()
+	case syscall.SIGHUP:
+		// start a new mosn
+		stagemanager.NoticeStop(stagemanager.Reload)
+	case syscall.SIGTERM:
+		// stop mosn gracefully
+		stagemanager.NoticeStop(stagemanager.GracefulStop)
+	case syscall.SIGINT, syscall.SIGQUIT: // syscall.SIGINT is same as os.Interrupt
+		// stop mosn immediately
+		stagemanager.NoticeStop(stagemanager.Stop)
+	default:
+		// do nothing
+	}
 }
 
-func OnProcessExit(cb func()) {
-	onProcessExit = append(onProcessExit, cb)
-}
+// DEPRECATED: please use stagemanager.OnGracefulStop instead
+// func OnProcessShutDown(cb func() error) {
 
-func OnProcessShutDown(cb func() error) {
-	shutdownCallbacks = append(shutdownCallbacks, cb)
-}
-
-func AddSignalCallback(signal syscall.Signal, cb func()) {
-	signalCallback[signal] = append(signalCallback[signal], cb)
-}
+// DEPRECATED: please use stagemanager.OnBeforeStop instead
+// func OnProcessShutDownFirst(cb func() error) {

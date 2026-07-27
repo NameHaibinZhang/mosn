@@ -26,7 +26,7 @@ import (
 
 	"github.com/rcrowley/go-metrics"
 	"mosn.io/api"
-	"mosn.io/mosn/pkg/config/v2"
+	v2 "mosn.io/mosn/pkg/config/v2"
 )
 
 //
@@ -94,10 +94,6 @@ type Listener interface {
 	// Start starts listener with context
 	Start(lctx context.Context, restart bool)
 
-	// Stop stops listener
-	// Accepted connections and listening sockets will not be closed
-	Stop() error
-
 	// ListenerTag returns the listener's tag, whichi the listener should use for connection handler tracking.
 	ListenerTag() uint64
 
@@ -113,11 +109,14 @@ type Listener interface {
 	// Set limit bytes per connection
 	SetPerConnBufferLimitBytes(limitBytes uint32)
 
-	// Set if listener should use original dst
-	SetUseOriginalDst(use bool)
+	// Set listener original dst type
+	SetOriginalDstType(use v2.OriginalDstType)
+
+	// Get listener original dst type
+	GetOriginalDstType() v2.OriginalDstType
 
 	// Get if listener should use original dst
-	UseOriginalDst() bool
+	IsOriginalDst() bool
 
 	// SetListenerCallbacks set a listener event listener
 	SetListenerCallbacks(cb ListenerEventListener)
@@ -125,20 +124,41 @@ type Listener interface {
 	// GetListenerCallbacks set a listener event listener
 	GetListenerCallbacks() ListenerEventListener
 
+	// Shutdown stop accepting new connections or closes the Listener, and then gracefully
+	// closes existing connections
+	//
+	// In the hot upgrade scenario, the Shutdown method only stops accepting new connections
+	// but does not close the Listener. The new Mosn can still handle some newly established
+	// connections after taking over the Listener.
+	//
+	// In non-hot upgrade scenarios, the Shutdown method will first close the Listener to directly
+	// reject the establishment of new connections. This is because if only new connection
+	// processing is stopped, the requests on these connections cannot be processed in the future.
+	Shutdown(lctx context.Context) error
+
 	// Close closes listener, not closing connections
 	Close(lctx context.Context) error
+
+	// IsBindToPort
+	IsBindToPort() bool
 }
 
 // ListenerEventListener is a Callback invoked by a listener.
 type ListenerEventListener interface {
 	// OnAccept is called on new connection accepted
-	OnAccept(rawc net.Conn, useOriginalDst bool, oriRemoteAddr net.Addr, c chan api.Connection, buf []byte)
+	OnAccept(rawc net.Conn, useOriginalDst bool, oriRemoteAddr net.Addr, c chan api.Connection, buf []byte, listeners []api.ConnectionEventListener)
 
 	// OnNewConnection is called on new mosn connection created
 	OnNewConnection(ctx context.Context, conn api.Connection)
 
 	// OnClose is called on listener close
 	OnClose()
+
+	// OnShutdown is called for graceful stop existing connections
+	OnShutdown()
+
+	// PreStopHook is called on listener quit(but before closed)
+	PreStopHook(ctx context.Context) func() error
 }
 
 type ListenerFilter interface {
@@ -177,22 +197,27 @@ type ClientConnection interface {
 
 	// connect to server in a async way
 	Connect() error
+
+	// set SO_MARK with this client Connection
+	SetMark(uint32)
 }
 
 // Default connection arguments
-const (
+var (
 	DefaultConnReadTimeout  = 15 * time.Second
 	DefaultConnWriteTimeout = 15 * time.Second
 	DefaultConnTryTimeout   = 60 * time.Second
 	DefaultIdleTimeout      = 90 * time.Second
+	DefaultUDPIdleTimeout   = 5 * time.Second
+	DefaultUDPReadTimeout   = 1 * time.Second
 )
 
 // ConnectionHandler contains the listeners for a mosn server
 type ConnectionHandler interface {
 	// AddOrUpdateListener
 	// adds a listener into the ConnectionHandler or
-	// update a listener
-	AddOrUpdateListener(lc *v2.Listener, updateListenerFilter bool, updateNetworkFilter bool, updateStreamFilter bool) (ListenerEventListener, error)
+	// updates a listener
+	AddOrUpdateListener(lc *v2.Listener) (ListenerEventListener, error)
 
 	//StartListeners starts all listeners the ConnectionHandler has
 	StartListeners(lctx context.Context)
@@ -203,17 +228,25 @@ type ConnectionHandler interface {
 	// FindListenerByName finds and returns a listener by the listener name
 	FindListenerByName(name string) Listener
 
-	// RemoveListeners find and removes a listener by listener name.
+	// RemoveListeners finds and removes a listener by listener name.
 	RemoveListeners(name string)
 
-	// StopListener stops a listener  by listener name
-	StopListener(lctx context.Context, name string, stop bool) error
+	// GracefulStopListener graceful stops a listener by listener name
+	// stop accept connections + graceful stop existing connections
+	GracefulStopListener(lctx context.Context, name string) error
 
-	// StopListeners stops all listeners the ConnectionHandler has.
-	// The close indicates whether the listening sockets will be closed.
-	StopListeners(lctx context.Context, close bool) error
+	// GracefulCloseListener graceful closes a listener by listener name
+	// stop accept connections + graceful stop existing connections + close listener
+	GracefulCloseListener(lctx context.Context, name string) error
 
-	// ListListenersFD reports all listeners' fd
+	// GracefulStopListeners stops accept connections from all listeners the ConnectionHandler has.
+	// and graceful stop all the existing connections.
+	GracefulStopListeners(lctx context.Context) error
+
+	// CloseListeners closes listeners immediately
+	CloseListeners()
+
+	// ListListenersFile reports all listeners' fd
 	ListListenersFile(lctx context.Context) []*os.File
 
 	// StopConnection Stop Connection
@@ -226,22 +259,8 @@ type FilterChainFactory interface {
 	CreateListenerFilterChain(listener ListenerFilterManager)
 }
 
-// Addresses defines a group of network address
-type Addresses []net.Addr
-
-// Contains reports whether the specified network address is in the group.
-func (as Addresses) Contains(addr net.Addr) bool {
-	for _, one := range as {
-		// TODO: support port wildcard
-		if one.String() == addr.String() {
-			return true
-		}
-	}
-
-	return false
-}
-
 var (
-	ErrConnectionHasClosed = errors.New("connection has closed")
-	ErrWriteTryLockTimeout = errors.New("write trylock has timeout")
+	ErrConnectionHasClosed    = errors.New("connection has closed")
+	ErrWriteTryLockTimeout    = errors.New("write trylock has timeout")
+	ErrWriteBufferChanTimeout = errors.New("writeBufferChan has timeout")
 )

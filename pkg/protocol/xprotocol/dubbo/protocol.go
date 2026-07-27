@@ -21,47 +21,52 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"sync/atomic"
+
+	hessian "github.com/apache/dubbo-go-hessian2"
+	"mosn.io/api"
 
 	"mosn.io/mosn/pkg/log"
-	"mosn.io/mosn/pkg/protocol/xprotocol"
 	"mosn.io/mosn/pkg/types"
 )
 
 /**
+* https://dubbo.apache.org/zh/docs/v2.7/dev/implementation/#%E8%BF%9C%E7%A8%8B%E9%80%9A%E8%AE%AF%E7%BB%86%E8%8A%82
 * Dubbo protocol
 * Request & Response: (byte)
 * 0           1           2           3           4           5           6           7           8
-* +-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+* +-----------+-----------+-----------+-----------+-----------------------------------------------+
 * |magic high | magic low |  flag     | status    |               id                              |
-* +-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
-* |      id                                       |               data length                     |
-* +-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
-* |                               payload                                                         |
+* +-----------+-----------+----+------+-----------------------------------------------------------+
+* |      id                    |                  |               data length                     |
+* +-----------------------------------------------+-----------------------------------------------+
+* |                            |  payload                                                         |
 * +-----------------------------------------------------------------------------------------------+
-* magic: 0xdabb
-*
+* magic: 0xdabb                |
+*                              |
+*                              |
+*   +--------------------------+
+*   |
+*   v
 * flag: (bit offset)
-* 0           1           2           3           4           5           6           7           8
-* +-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
-* |              serialization id                             |  event    | two way   |   req/rsp |
-* +-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+* 8           7           6           5           4           3           2           1           0
+* +-----------+-----------+-----------+-----------------------------------------------------------+
+* |   req/rsp | two way   |  event    |              serialization id                             |
+* +-----------+-----------+-----------+-----------------------------------------------------------+
 * event: 1 mean ping
 * two way: 1 mean req & rsp pair
 * req/rsp: 1 mean req
  */
-func init() {
-	xprotocol.RegisterProtocol(ProtocolName, &dubboProtocol{})
-}
 
 var MagicTag = []byte{0xda, 0xbb}
 
 type dubboProtocol struct{}
 
-func (proto *dubboProtocol) Name() types.ProtocolName {
+func (proto dubboProtocol) Name() types.ProtocolName {
 	return ProtocolName
 }
 
-func (proto *dubboProtocol) Encode(ctx context.Context, model interface{}) (types.IoBuffer, error) {
+func (proto dubboProtocol) Encode(ctx context.Context, model interface{}) (types.IoBuffer, error) {
 	if frame, ok := model.(*Frame); ok {
 		if frame.Direction == EventRequest {
 			return encodeRequest(ctx, frame)
@@ -70,10 +75,10 @@ func (proto *dubboProtocol) Encode(ctx context.Context, model interface{}) (type
 		}
 	}
 	log.Proxy.Errorf(ctx, "[protocol][dubbo] encode with unknown command : %+v", model)
-	return nil, xprotocol.ErrUnknownType
+	return nil, api.ErrUnknownType
 }
 
-func (proto *dubboProtocol) Decode(ctx context.Context, data types.IoBuffer) (interface{}, error) {
+func (proto dubboProtocol) Decode(ctx context.Context, data types.IoBuffer) (interface{}, error) {
 	if data.Len() >= HeaderLen {
 		// check frame size
 		payLoadLen := binary.BigEndian.Uint32(data.Bytes()[DataLenIdx:(DataLenIdx + DataLenSize)])
@@ -90,32 +95,64 @@ func (proto *dubboProtocol) Decode(ctx context.Context, data types.IoBuffer) (in
 }
 
 // heartbeater
-func (proto *dubboProtocol) Trigger(requestId uint64) xprotocol.XFrame {
+func (proto dubboProtocol) Trigger(ctx context.Context, requestId uint64) api.XFrame {
 	// not support
 	return nil
 }
 
-func (proto *dubboProtocol) Reply(requestId uint64) xprotocol.XRespFrame {
+func (proto dubboProtocol) Reply(ctx context.Context, request api.XFrame) api.XRespFrame {
 	// TODO make readable
 	return &Frame{
 		Header: Header{
 			Magic:   MagicTag,
 			Flag:    0x22,
 			Status:  0x14,
-			Id:      requestId,
+			Id:      request.GetRequestId(),
 			DataLen: 0x02,
 		},
 		payload: []byte{0x4e, 0x4e},
 	}
 }
 
+// https://dubbo.apache.org/zh/docs/v2.7/dev/implementation/#%E8%BF%9C%E7%A8%8B%E9%80%9A%E8%AE%AF%E7%BB%86%E8%8A%82
 // hijacker
-func (proto *dubboProtocol) Hijack(statusCode uint32) xprotocol.XRespFrame {
-	// not support
-	return nil
+func (proto dubboProtocol) Hijack(ctx context.Context, request api.XFrame, statusCode uint32) api.XRespFrame {
+	dubboStatus, ok := dubboMosnStatusMap[int(statusCode)]
+	if !ok {
+		dubboStatus = dubboStatusInfo{
+			Status: hessian.Response_SERVICE_ERROR,
+			Msg:    fmt.Sprintf("%d status not define", statusCode),
+		}
+	}
+
+	encoder := hessian.NewEncoder()
+	encoder.Encode(dubboStatus.Msg)
+	payload := encoder.Buffer()
+	return &Frame{
+		Header: Header{
+			Magic:   MagicTag,
+			Flag:    0x02,
+			Status:  dubboStatus.Status,
+			Id:      request.GetRequestId(),
+			DataLen: uint32(len(payload)),
+		},
+		payload: payload,
+	}
 }
 
-func (proto *dubboProtocol) Mapping(httpStatusCode uint32) uint32 {
-	// not support
-	return 0
+func (proto dubboProtocol) Mapping(httpStatusCode uint32) uint32 {
+	return httpStatusCode
+}
+
+// PoolMode returns whether pingpong or multiplex
+func (proto dubboProtocol) PoolMode() api.PoolMode {
+	return api.Multiplex
+}
+
+func (proto dubboProtocol) EnableWorkerPool() bool {
+	return true
+}
+
+func (proto dubboProtocol) GenerateRequestID(streamID *uint64) uint64 {
+	return atomic.AddUint64(streamID, 1)
 }

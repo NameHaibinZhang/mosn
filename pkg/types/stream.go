@@ -96,7 +96,7 @@ import (
 //
 
 // StreamResetReason defines the reason why stream reset
-type StreamResetReason string
+type StreamResetReason = string
 
 // Group of stream reset reasons
 const (
@@ -178,7 +178,10 @@ type StreamConnection interface {
 	Dispatch(buffer buffer.IoBuffer)
 
 	// Protocol on the connection
-	Protocol() api.Protocol
+	Protocol() api.ProtocolName
+
+	// EnableWorkerPool means enable worker pool on downstream OnReceive
+	EnableWorkerPool() bool
 
 	// Active streams count
 	ActiveStreamsNum() int
@@ -219,7 +222,7 @@ type ServerStreamConnectionEventListener interface {
 	StreamConnectionEventListener
 
 	// NewStreamDetect returns stream event receiver
-	NewStreamDetect(context context.Context, sender StreamSender, span Span) StreamReceiveListener
+	NewStreamDetect(context context.Context, sender StreamSender, span api.Span) StreamReceiveListener
 }
 
 // PoolFailureReason type
@@ -231,26 +234,43 @@ const (
 	ConnectionFailure PoolFailureReason = "ConnectionFailure"
 )
 
-//  ConnectionPool is a connection pool interface to extend various of protocols
+// ConnectionPool is a connection pool interface to extend various of protocols
 type ConnectionPool interface {
-	Protocol() api.Protocol
+	Protocol() api.ProtocolName
 
-	NewStream(ctx context.Context, receiver StreamReceiveListener, listener PoolEventListener)
+	NewStream(ctx context.Context, receiver StreamReceiveListener) (Host, StreamSender, PoolFailureReason)
 
 	// check host health and init host
 	CheckAndInit(ctx context.Context) bool
 
-	// SupportTLS represents the connection support tls or not
-	SupportTLS() bool
+	// TLSHashValue returns the TLS Config's HashValue.
+	// If HashValue is changed, the connection pool will be changed.
+	TLSHashValue() *HashValue
 
 	// Shutdown gracefully shuts down the connection pool without interrupting any active requests
 	Shutdown()
 
 	Close()
+
+	// Host get host
+	Host() Host
 }
 
-type PoolEventListener interface {
-	OnFailure(reason PoolFailureReason, host Host)
+// NewConnPool is a function to create ConnectionPool
+type NewConnPool func(ctx context.Context, host Host) ConnectionPool
 
-	OnReady(sender StreamSender, host Host)
+// ProtocolStreamFactory can create protocol stream and check whether the request is matched or not.
+type ProtocolStreamFactory interface {
+	CreateClientStream(context context.Context, connection ClientConnection,
+		streamConnCallbacks StreamConnectionEventListener,
+		callbacks api.ConnectionEventListener) ClientStreamConnection
+
+	CreateServerStream(context context.Context, connection api.Connection,
+		callbacks ServerStreamConnectionEventListener) ServerStreamConnection
+
+	CreateBiDirectStream(context context.Context, connection ClientConnection,
+		clientCallbacks StreamConnectionEventListener,
+		serverCallbacks ServerStreamConnectionEventListener) ClientStreamConnection
+
+	ProtocolMatch(context context.Context, prot string, magic []byte) error
 }

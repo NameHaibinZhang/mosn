@@ -17,25 +17,18 @@
 
 package bolt
 
-import (
-	"mosn.io/mosn/pkg/protocol/xprotocol"
-	"mosn.io/mosn/pkg/types"
-)
-
-func init() {
-	xprotocol.RegisterMatcher(ProtocolName, boltMatcher)
-}
+import "mosn.io/api"
 
 // predicate first byte '0x1'
-func boltMatcher(data []byte) types.MatchResult {
+func boltMatcher(data []byte) api.MatchResult {
 	length := len(data)
 	if length == 0 {
-		return types.MatchAgain
+		return api.MatchAgain
 	}
 
 	if data[0] == ProtocolCode {
-		return types.MatchSuccess
+		return api.MatchSuccess
 	}
 
-	return types.MatchFailed
+	return api.MatchFailed
 }

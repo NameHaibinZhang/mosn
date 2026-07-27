@@ -21,10 +21,11 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync/atomic"
 
+	"mosn.io/api"
 	"mosn.io/mosn/pkg/log"
-	"mosn.io/mosn/pkg/protocol/xprotocol"
-	"mosn.io/mosn/pkg/types"
+	"mosn.io/mosn/pkg/protocol/xprotocol/internal/registry"
 )
 
 /**
@@ -63,30 +64,44 @@ import (
  * respstatus: response status
  */
 
-func init() {
-	xprotocol.RegisterProtocol(ProtocolName, &boltProtocol{})
-}
-
 type boltProtocol struct{}
 
-// types.Protocol
-func (proto *boltProtocol) Name() types.ProtocolName {
+// api.Protocol
+func (proto boltProtocol) Name() api.ProtocolName {
 	return ProtocolName
 }
 
-func (proto *boltProtocol) Encode(ctx context.Context, model interface{}) (types.IoBuffer, error) {
+func (proto boltProtocol) Encode(ctx context.Context, model interface{}) (api.IoBuffer, error) {
 	switch frame := model.(type) {
 	case *Request:
 		return encodeRequest(ctx, frame)
 	case *Response:
 		return encodeResponse(ctx, frame)
 	default:
-		log.Proxy.Errorf(ctx, "[protocol][bolt] encode with unknown command : %+v", model)
-		return nil, xprotocol.ErrUnknownType
+		// log.Proxy.Errorf(ctx, "[protocol][bolt] encode with unknown command : %+v", model)
+		// return nil, api.ErrUnknownType
+		// FIXME: makes sofarpc protocol common
+		// bolt and boltv2 can be handled success on a same connection
+		if log.Proxy.GetLogLevel() >= log.DEBUG {
+			log.Proxy.Debugf(ctx, "[protocol][bolt] bolt maybe receive boltv2 encode")
+		}
+		// TODO: use internal package to avoid cycle import temporary
+		// makes bolt and boltv2 reuse in same package
+		engine := registry.GetXProtocolCodec("boltv2").NewXProtocol(ctx)
+		return engine.Encode(ctx, model)
 	}
 }
 
-func (proto *boltProtocol) Decode(ctx context.Context, data types.IoBuffer) (interface{}, error) {
+func (proto boltProtocol) Decode(ctx context.Context, data api.IoBuffer) (interface{}, error) {
+	if data.Len() > 0 {
+		code := data.Bytes()[0]
+		if code == 0x02 { // protocol boltv2
+			// TODO: use internal package to avoid cycle import temporary
+			// makes bolt and boltv2 reuse in same package
+			engine := registry.GetXProtocolCodec("boltv2").NewXProtocol(ctx)
+			return engine.Decode(ctx, data)
+		}
+	}
 	if data.Len() >= LessLen {
 		cmdType := data.Bytes()[1]
 
@@ -106,8 +121,29 @@ func (proto *boltProtocol) Decode(ctx context.Context, data types.IoBuffer) (int
 	return nil, nil
 }
 
+// GoAwayer
+func (proto boltProtocol) GoAway(ctx context.Context) api.XFrame {
+	// GoAway is disabled
+	config := parseConfig(ctx)
+	if !config.EnableBoltGoAway {
+		return nil
+	}
+
+	return &Request{
+		RequestHeader: RequestHeader{
+			Protocol:  ProtocolCode,
+			CmdType:   CmdTypeRequest,
+			CmdCode:   CmdCodeGoAway,
+			Version:   ProtocolVersion,
+			RequestId: 0, // this would be overwrite by stream layer
+			Codec:     Hessian2Serialize,
+			Timeout:   0,
+		},
+	}
+}
+
 // Heartbeater
-func (proto *boltProtocol) Trigger(requestId uint64) xprotocol.XFrame {
+func (proto boltProtocol) Trigger(ctx context.Context, requestId uint64) api.XFrame {
 	return &Request{
 		RequestHeader: RequestHeader{
 			Protocol:  ProtocolCode,
@@ -115,28 +151,28 @@ func (proto *boltProtocol) Trigger(requestId uint64) xprotocol.XFrame {
 			CmdCode:   CmdCodeHeartbeat,
 			Version:   1,
 			RequestId: uint32(requestId),
-			Codec:     Hessian2Serialize, //todo: read default codec from config
+			Codec:     Hessian2Serialize,
 			Timeout:   -1,
 		},
 	}
 }
 
-func (proto *boltProtocol) Reply(requestId uint64) xprotocol.XRespFrame {
+func (proto boltProtocol) Reply(ctx context.Context, request api.XFrame) api.XRespFrame {
 	return &Response{
 		ResponseHeader: ResponseHeader{
 			Protocol:       ProtocolCode,
 			CmdType:        CmdTypeResponse,
 			CmdCode:        CmdCodeHeartbeat,
 			Version:        ProtocolVersion,
-			RequestId:      uint32(requestId),
-			Codec:          Hessian2Serialize, //todo: read default codec from config
+			RequestId:      uint32(request.GetRequestId()),
+			Codec:          Hessian2Serialize,
 			ResponseStatus: ResponseStatusSuccess,
 		},
 	}
 }
 
 // Hijacker
-func (proto *boltProtocol) Hijack(statusCode uint32) xprotocol.XRespFrame {
+func (proto boltProtocol) Hijack(ctx context.Context, request api.XFrame, statusCode uint32) api.XRespFrame {
 	return &Response{
 		ResponseHeader: ResponseHeader{
 			Protocol:       ProtocolCode,
@@ -150,26 +186,44 @@ func (proto *boltProtocol) Hijack(statusCode uint32) xprotocol.XRespFrame {
 	}
 }
 
-func (proto *boltProtocol) Mapping(httpStatusCode uint32) uint32 {
+func (proto boltProtocol) Mapping(httpStatusCode uint32) uint32 {
 	switch httpStatusCode {
 	case http.StatusOK:
 		return uint32(ResponseStatusSuccess)
-	case types.RouterUnavailableCode:
+	case api.RouterUnavailableCode:
 		return uint32(ResponseStatusNoProcessor)
-	case types.NoHealthUpstreamCode:
-		return uint32(ResponseStatusConnectionClosed)
-	case types.UpstreamOverFlowCode:
+	case api.NoHealthUpstreamCode:
+		return uint32(ResponseStatusNoProcessor)
+	case api.UpstreamOverFlowCode:
 		return uint32(ResponseStatusServerThreadpoolBusy)
-	case types.CodecExceptionCode:
+	case api.CodecExceptionCode:
 		//Decode or Encode Error
 		return uint32(ResponseStatusCodecException)
-	case types.DeserialExceptionCode:
+	case api.DeserialExceptionCode:
 		//Hessian Exception
 		return uint32(ResponseStatusServerDeserialException)
-	case types.TimeoutExceptionCode:
+	case api.TimeoutExceptionCode:
 		//Response Timeout
 		return uint32(ResponseStatusTimeout)
+	case api.PermissionDeniedCode:
+		//Response Permission Denied
+		// bolt protocol do not have a permission deny code, use server exception
+		return uint32(ResponseStatusServerException)
 	default:
 		return uint32(ResponseStatusUnknown)
 	}
+}
+
+// PoolMode returns whether pingpong or multiplex
+func (proto boltProtocol) PoolMode() api.PoolMode {
+	return api.Multiplex
+}
+
+func (proto boltProtocol) EnableWorkerPool() bool {
+	return true
+}
+
+func (proto boltProtocol) GenerateRequestID(streamID *uint64) uint64 {
+	// fix bug for issue: https://github.com/mosn/mosn/issues/2403
+	return uint64(uint32(atomic.AddUint64(streamID, 1)))
 }

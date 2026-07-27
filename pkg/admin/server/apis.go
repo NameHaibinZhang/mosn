@@ -19,16 +19,22 @@ package server
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"os"
+	"strconv"
 
-	"mosn.io/mosn/pkg/admin/store"
+	gometrics "github.com/rcrowley/go-metrics"
+	v2 "mosn.io/mosn/pkg/config/v2"
+	"mosn.io/mosn/pkg/configmanager"
+	"mosn.io/mosn/pkg/featuregate"
 	"mosn.io/mosn/pkg/log"
 	"mosn.io/mosn/pkg/metrics"
 	"mosn.io/mosn/pkg/metrics/sink/console"
 	"mosn.io/mosn/pkg/plugin"
+	"mosn.io/mosn/pkg/stagemanager"
 	"mosn.io/mosn/pkg/types"
 )
 
@@ -41,15 +47,17 @@ var levelMap = map[string]log.Level{
 	"TRACE": log.TRACE,
 }
 
+var version string
+
 const errMsgFmt = `{
 	"error": "%s"
 }
 `
 
-func help(w http.ResponseWriter, r *http.Request) {
+func Help(w http.ResponseWriter, r *http.Request) {
 	var buf bytes.Buffer
-	buf.WriteString("support apis:\n")
-	for key := range apiHandleFuncStore {
+	buf.WriteString("supported APIs:\n")
+	for key := range apiHandlerStore {
 		if key != "/" { // do not show this pages
 			buf.WriteString(key)
 			buf.WriteRune('\n')
@@ -58,34 +66,143 @@ func help(w http.ResponseWriter, r *http.Request) {
 	w.Write(buf.Bytes())
 }
 
-func configDump(w http.ResponseWriter, r *http.Request) {
+func SetVersion(v string) {
+	version = v
+}
+
+func OutputVersion(w http.ResponseWriter, r *http.Request) {
+	w.Write([]byte("mosn version: " + version))
+}
+
+func ConfigDump(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		log.DefaultLogger.Alertf(types.ErrorKeyAdmin, "api: %s, error: invalid method: %s", "config dump", r.Method)
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	if buf, err := store.Dump(); err == nil {
+	r.ParseForm()
+	if len(r.Form) == 0 {
+		buf, _ := configmanager.DumpJSON()
 		log.DefaultLogger.Infof("[admin api] [config dump] config dump")
 		w.WriteHeader(200)
 		w.Write(buf)
-	} else {
-		log.DefaultLogger.Alertf(types.ErrorKeyAdmin, "api: %s, error: %v", "config dump", err)
-		w.WriteHeader(500)
-		msg := fmt.Sprintf(errMsgFmt, "internal error")
-		fmt.Fprint(w, msg)
+		return
 	}
+	if len(r.Form) > 1 {
+		w.WriteHeader(400)
+		fmt.Fprintf(w, "only support one parameter")
+		return
+	}
+	handle := func(info interface{}) {
+		if info == nil {
+			log.DefaultLogger.Alertf(types.ErrorKeyAdmin, "api: %s, parameters:%v", "config dump", r.Form)
+			w.WriteHeader(500)
+			msg := fmt.Sprintf(errMsgFmt, "internal error")
+			fmt.Fprint(w, msg)
+		} else {
+			buf, _ := json.MarshalIndent(info, "", " ")
+			log.DefaultLogger.Infof("[admin api] [config dump] config dump, parameters:%v", r.Form)
+			w.WriteHeader(200)
+			w.Write(buf)
+		}
+	}
+	for key, param := range r.Form {
+		p := param
+		switch key {
+		case "mosnconfig":
+			configmanager.HandleMOSNConfig(configmanager.CfgTypeMOSN, handle)
+		case "allrouters":
+			configmanager.HandleMOSNConfig(configmanager.CfgTypeRouter, handle)
+		case "allclusters":
+			configmanager.HandleMOSNConfig(configmanager.CfgTypeCluster, handle)
+		case "alllisteners":
+			configmanager.HandleMOSNConfig(configmanager.CfgTypeListener, handle)
+		case "router":
+			configmanager.HandleMOSNConfig(configmanager.CfgTypeRouter, func(v interface{}) {
+				routerInfo, ok := v.(map[string]v2.RouterConfiguration)
+				if ok && len(p) > 0 {
+					handle(routerInfo[p[0]])
+				}
+			})
+
+		case "cluster":
+			configmanager.HandleMOSNConfig(configmanager.CfgTypeCluster, func(v interface{}) {
+				clusterInfo, ok := v.(map[string]v2.Cluster)
+				if ok && len(p) > 0 {
+					handle(clusterInfo[p[0]])
+				}
+			})
+
+		case "listener":
+			configmanager.HandleMOSNConfig(configmanager.CfgTypeListener, func(v interface{}) {
+				listenerInfo, ok := v.(map[string]v2.Listener)
+				if ok && len(p) > 0 {
+					handle(listenerInfo[p[0]])
+				}
+			})
+		default:
+			handle(nil)
+		}
+	}
+
 }
 
-func statsDump(w http.ResponseWriter, r *http.Request) {
+func StatsDump(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		log.DefaultLogger.Alertf(types.ErrorKeyAdmin, "api: %s, error: invalid method: %s", "stats dump", r.Method)
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 	log.DefaultLogger.Infof("[admin api]  [stats dump] stats dump")
-	w.WriteHeader(200)
+	r.ParseForm()
+	if len(r.Form) == 0 {
+		allMetrics := metrics.GetAll()
+		w.WriteHeader(200)
+		sink := console.NewConsoleSink()
+		sink.Flush(w, allMetrics)
+		return
+	}
+	if len(r.Form) > 1 {
+		w.WriteHeader(400)
+		fmt.Fprintf(w, "only support one parameter")
+		return
+	}
+	key := r.FormValue("key")
+	m := metrics.GetMetricsFilter(key)
+	if m == nil {
+		w.WriteHeader(200)
+		fmt.Fprintf(w, "no metrics key: %s", key)
+		return
+	}
 	sink := console.NewConsoleSink()
-	sink.Flush(w, metrics.GetAll())
+	sink.Flush(w, []types.Metrics{m})
+}
+
+func StatsDumpProxyTotal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		log.DefaultLogger.Alertf(types.ErrorKeyAdmin, "api: %s, error: invalid method: %s", "stats dump", r.Method)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	log.DefaultLogger.Infof("[admin api]  [stats dump] stats dump")
+	w.WriteHeader(http.StatusOK)
+	m := metrics.GetProxyTotal()
+	all := ""
+	if m != nil {
+		m.Each(func(key string, i interface{}) {
+			switch metric := i.(type) {
+			case gometrics.Counter:
+				all += fmt.Sprintf("%s:%s\n", key, strconv.FormatInt(metric.Count(), 10))
+			case gometrics.Gauge:
+				all += fmt.Sprintf("%s:%s\n", key, strconv.FormatInt(metric.Value(), 10))
+			case gometrics.Histogram:
+				h := metric.Snapshot()
+				all += fmt.Sprintf("%s:%s\n", key+"_min", strconv.FormatInt(h.Min(), 10))
+				all += fmt.Sprintf("%s:%s\n", key+"_max", strconv.FormatInt(h.Max(), 10))
+			}
+		})
+	}
+	w.Write([]byte(all))
 }
 
 // update log level
@@ -94,7 +211,18 @@ type LogLevelData struct {
 	LogLevel string `json:"log_level"`
 }
 
-func updateLogLevel(w http.ResponseWriter, r *http.Request) {
+func GetLoggerInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		log.DefaultLogger.Alertf(types.ErrorKeyAdmin, "api: %s, error: invalid method: %s", "update log level", r.Method)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	lg := log.GetErrorLoggersInfo()
+	data, _ := json.Marshal(lg)
+	w.Write(data)
+}
+
+func UpdateLogLevel(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		log.DefaultLogger.Alertf(types.ErrorKeyAdmin, "api: %s, error: invalid method: %s", "update log level", r.Method)
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -109,7 +237,7 @@ func updateLogLevel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := &LogLevelData{}
-	if err := json.Unmarshal(body, data); err == nil {
+	if err = json.Unmarshal(body, data); err == nil {
 		if level, ok := levelMap[data.LogLevel]; ok {
 			if log.UpdateErrorLoggerLevel(data.LogPath, level) {
 				log.DefaultLogger.Infof("[admin api] [update log level] update log: %s level as %s", data.LogPath, data.LogLevel)
@@ -118,8 +246,10 @@ func updateLogLevel(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+
+		err = errors.New("not found log level: " + data.LogLevel)
 	}
-	log.DefaultLogger.Alertf(types.ErrorKeyAdmin, "api: %s, update logger level failed with bad request data: %s", "update log level", string(body))
+	log.DefaultLogger.Alertf(types.ErrorKeyAdmin, "api: %s, update logger level failed with bad request data: %s, error: %v", "update log level", string(body), err)
 	w.WriteHeader(http.StatusBadRequest) // 400
 	msg := fmt.Sprintf(errMsgFmt, "update logger failed")
 	fmt.Fprint(w, msg)
@@ -127,7 +257,7 @@ func updateLogLevel(w http.ResponseWriter, r *http.Request) {
 
 // post data:
 // loggeer path
-func enableLogger(w http.ResponseWriter, r *http.Request) {
+func EnableLogger(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		log.DefaultLogger.Alertf(types.ErrorKeyAdmin, "api: %s, error: invalid method: %s", "enable logger", r.Method)
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -153,7 +283,7 @@ func enableLogger(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "enable logger success\n")
 }
 
-func disableLogger(w http.ResponseWriter, r *http.Request) {
+func DisableLogger(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		log.DefaultLogger.Alertf(types.ErrorKeyAdmin, "api: %s, error: invalid method: %s", "disable logger", r.Method)
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -170,7 +300,7 @@ func disableLogger(w http.ResponseWriter, r *http.Request) {
 	if !log.ToggleLogger(string(loggerPath), true) {
 		log.DefaultLogger.Alertf(types.ErrorKeyAdmin, "api: %s, error: enbale %s logger failed", "disable logger", string(loggerPath))
 		w.WriteHeader(http.StatusBadRequest) // 400
-		msg := fmt.Sprintf(errMsgFmt, "disbale logger failed")
+		msg := fmt.Sprintf(errMsgFmt, "disable logger failed")
 		fmt.Fprint(w, msg)
 		return
 	}
@@ -181,14 +311,14 @@ func disableLogger(w http.ResponseWriter, r *http.Request) {
 
 // returns data
 // pid=xxx&state=xxx
-func getState(w http.ResponseWriter, r *http.Request) {
+func GetState(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		log.DefaultLogger.Alertf(types.ErrorKeyAdmin, "api: %s, error: invalid method: %s", "get state", r.Method)
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 	pid := os.Getpid()
-	state := store.GetMosnState()
+	state := stagemanager.GetState()
 	msg := fmt.Sprintf("pid=%d&state=%d\n", pid, state)
 	fmt.Fprint(w, msg)
 }
@@ -197,7 +327,59 @@ func getState(w http.ResponseWriter, r *http.Request) {
 // http://ip:port/plugin?disable=pluginname
 // http://ip:port/plugin?status=pluginname
 // http://ip:port/plugin?status=all
-func pluginApi(w http.ResponseWriter, r *http.Request) {
+func PluginApi(w http.ResponseWriter, r *http.Request) {
 	log.DefaultLogger.Infof("[admin api] [plugin] url %s", r.URL.RequestURI())
 	plugin.AdminApi(w, r)
+}
+
+func KnownFeatures(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		log.DefaultLogger.Alertf(types.ErrorKeyAdmin, "api: %s, error: invalid method: %s", "known features", r.Method)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	r.ParseForm()
+	if len(r.Form) == 0 {
+		data, _ := json.MarshalIndent(featuregate.KnownFeatures(), "", " ")
+		w.Write(data)
+		return
+	}
+	// support only one feature
+	value := r.FormValue("key")
+	fmt.Fprintf(w, "%t", featuregate.Enabled(featuregate.Feature(value)))
+}
+
+type envResults struct {
+	Env      map[string]string `json:"env,omityempty"`
+	NotFound []string          `json:"not_found,omityempty"`
+}
+
+func GetEnv(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		log.DefaultLogger.Alertf(types.ErrorKeyAdmin, "api: %s, error: invalid method: %s", "get env", r.Method)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	r.ParseForm()
+	values, ok := r.Form["key"]
+	if !ok {
+		log.DefaultLogger.Alertf(types.ErrorKeyAdmin, "api: %s no env key", "get env")
+		w.WriteHeader(http.StatusBadRequest)
+		msg := fmt.Sprintf(errMsgFmt, "no env key")
+		fmt.Fprint(w, msg)
+		return
+	}
+	results := &envResults{
+		Env: make(map[string]string),
+	}
+	for _, key := range values {
+		v, exists := os.LookupEnv(key)
+		if !exists {
+			results.NotFound = append(results.NotFound, key)
+		} else {
+			results.Env[key] = v
+		}
+	}
+	data, _ := json.MarshalIndent(results, "", " ")
+	w.Write(data)
 }

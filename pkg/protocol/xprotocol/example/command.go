@@ -18,8 +18,9 @@
 package example
 
 import (
-	"mosn.io/mosn/pkg/protocol/xprotocol"
+	"mosn.io/api"
 	"mosn.io/mosn/pkg/types"
+	"mosn.io/pkg/header"
 )
 
 type Request struct {
@@ -28,10 +29,37 @@ type Request struct {
 	PayloadLen uint32
 	Payload    []byte
 	Content    types.IoBuffer
+	header.CommonHeader
 }
 
-func (r *Request) GetStreamType() xprotocol.StreamType {
-	return xprotocol.Request
+func (r *Request) IsHeartbeatFrame() bool {
+	return r.Type == TypeHeartbeat
+}
+
+func (r *Request) IsGoAwayFrame() bool {
+	return r.Type == TypeGoAway
+}
+
+func (r *Request) GetTimeout() int32 {
+	return -1
+}
+
+func (r *Request) GetHeader() api.HeaderMap {
+	return r
+}
+
+func (r *Request) GetData() api.IoBuffer {
+	return r.Content
+}
+
+func (r *Request) SetData(data api.IoBuffer) {
+	if r.Content != data {
+		r.Content = data
+	}
+}
+
+func (r *Request) GetStreamType() api.StreamType {
+	return api.Request
 }
 
 func (r *Request) GetRequestId() uint64 {
@@ -47,8 +75,14 @@ type Response struct {
 	Status uint16
 }
 
-func (r *Response) GetStreamType() xprotocol.StreamType {
-	return xprotocol.Response
+var _ api.XRespFrame = &Response{}
+
+func (r *Response) GetStatusCode() uint32 {
+	return uint32(r.Status)
+}
+
+func (r *Response) GetStreamType() api.StreamType {
+	return api.Response
 }
 
 func (r *Response) GetRequestId() uint64 {
@@ -57,6 +91,10 @@ func (r *Response) GetRequestId() uint64 {
 
 func (r *Response) SetRequestId(id uint64) {
 	r.RequestId = uint32(id)
+}
+
+func (r *Response) GetHeader() api.HeaderMap {
+	return r
 }
 
 type MessageCommand struct {

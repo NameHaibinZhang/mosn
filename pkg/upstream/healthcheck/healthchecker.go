@@ -30,9 +30,15 @@ import (
 )
 
 const (
-	DefaultTimeout  = time.Second
-	DefaultInterval = 15 * time.Second
+	DefaultTimeout        = time.Second
+	DefaultInterval       = 15 * time.Second
+	DefaultIntervalJitter = 5 * time.Millisecond
+
+	DefaultHealthyThreshold   uint32 = 1
+	DefaultUnhealthyThreshold uint32 = 1
 )
+
+// TODO: move healthcheck package to cluster package
 
 // healthChecker is a basic implementation of a health checker.
 // we use different implementations of types.Session to implement different health checker
@@ -40,93 +46,157 @@ type healthChecker struct {
 	//
 	sessionConfig       map[string]interface{}
 	sessionFactory      types.HealthCheckSessionFactory
-	mutex               sync.Mutex
 	checkers            map[string]*sessionChecker
 	localProcessHealthy int64
-	hosts               []types.Host
+	hosts               types.HostSet
 	stats               *healthCheckStats
 	// check config
 	timeout            time.Duration
 	intervalBase       time.Duration
 	intervalJitter     time.Duration
 	healthyThreshold   uint32
+	initialDelay       time.Duration
 	unhealthyThreshold uint32
-	rander             *rand.Rand
+	rander             rand.Rand
+	mux                sync.Mutex
 	hostCheckCallbacks []types.HealthCheckCb
+	logger             types.HealthCheckLog
 }
 
 func newHealthChecker(cfg v2.HealthCheck, f types.HealthCheckSessionFactory) types.HealthChecker {
-	timeout := DefaultTimeout
-	if cfg.Timeout != 0 {
-		timeout = cfg.Timeout
+	timeout := cfg.Timeout
+	if cfg.Timeout == 0 {
+		timeout = DefaultTimeout
 	}
-	interval := DefaultInterval
-	if cfg.Interval != 0 {
-		interval = cfg.Interval
+	interval := cfg.Interval
+	if cfg.Interval == 0 {
+		interval = DefaultInterval
 	}
+	unhealthyThreshold := cfg.UnhealthyThreshold
+	if unhealthyThreshold == 0 {
+		unhealthyThreshold = DefaultUnhealthyThreshold
+	}
+	healthyThreshold := cfg.HealthyThreshold
+	if healthyThreshold == 0 {
+		healthyThreshold = DefaultHealthyThreshold
+	}
+	intervalJitter := cfg.IntervalJitter
+	if intervalJitter == 0 {
+		intervalJitter = DefaultIntervalJitter
+	}
+	initialDelay := firstInterval
+	if cfg.InitialDelaySeconds.Duration > 0 {
+		initialDelay = cfg.InitialDelaySeconds.Duration
+	}
+
 	hc := &healthChecker{
 		// cfg
 		sessionConfig:      cfg.SessionConfig,
 		timeout:            timeout,
 		intervalBase:       interval,
-		intervalJitter:     cfg.IntervalJitter,
-		healthyThreshold:   cfg.HealthyThreshold,
-		unhealthyThreshold: cfg.UnhealthyThreshold,
+		intervalJitter:     intervalJitter,
+		healthyThreshold:   healthyThreshold,
+		unhealthyThreshold: unhealthyThreshold,
+		initialDelay:       initialDelay,
 		//runtime and stats
-		rander:             rand.New(rand.NewSource(time.Now().UnixNano())),
+		rander:             *rand.New(rand.NewSource(time.Now().UnixNano())),
 		hostCheckCallbacks: []types.HealthCheckCb{},
 		sessionFactory:     f,
-		mutex:              sync.Mutex{},
 		checkers:           make(map[string]*sessionChecker),
 		stats:              newHealthCheckStats(cfg.ServiceName),
+		logger:             NewHealthCheckLogger(cfg.EventLogPath),
 	}
+
 	// Add common callbacks when create
 	// common callbacks should be registered and configured
 	for _, name := range cfg.CommonCallbacks {
-		if cb, ok := commonCallbacks[name]; ok {
-			hc.AddHostCheckCompleteCb(cb)
+		v, exists := commonCallbacks.Load(name)
+		if exists {
+			if cb, ok := v.(types.HealthCheckCb); ok {
+				hc.AddHostCheckCompleteCb(cb)
+			}
+
 		}
 	}
 	return hc
 }
 
+// only called in cluster, lock in cluster
 func (hc *healthChecker) Start() {
-	hc.mutex.Lock()
-	defer hc.mutex.Unlock()
 	hc.start()
 }
 
 func (hc *healthChecker) start() {
-	for _, h := range hc.hosts {
+	hc.hosts.Range(func(h types.Host) bool {
 		hc.startCheck(h)
-	}
+		return true
+	})
 	hc.stats.healthy.Update(atomic.LoadInt64(&hc.localProcessHealthy))
 
 }
 
+// only called in cluster, lock in cluster
 func (hc *healthChecker) Stop() {
-	hc.mutex.Lock()
-	defer hc.mutex.Unlock()
 	hc.stop()
 }
 
 func (hc *healthChecker) stop() {
-	for _, h := range hc.hosts {
-		hc.stopCheck(h)
+	if hc.hosts == nil {
+		return
 	}
+	hc.hosts.Range(func(h types.Host) bool {
+		hc.stopCheck(h)
+		return true
+	})
 }
 
 func (hc *healthChecker) AddHostCheckCompleteCb(cb types.HealthCheckCb) {
 	hc.hostCheckCallbacks = append(hc.hostCheckCallbacks, cb)
 }
 
+// only called in cluster, lock in cluster
 // SetHealthCheckerHostSet reset the healthchecker's hosts
 func (hc *healthChecker) SetHealthCheckerHostSet(hostSet types.HostSet) {
-	hc.mutex.Lock()
-	defer hc.mutex.Unlock()
-	hc.stop()
-	hc.hosts = hostSet.Hosts()
-	hc.start()
+	deleteHosts, newHosts := findNewAndDeleteHost(hc.hosts, hostSet)
+	for _, newHost := range newHosts {
+		hc.startCheck(newHost)
+	}
+	for _, deleteHost := range deleteHosts {
+		hc.stopCheck(deleteHost)
+	}
+	hc.hosts = hostSet
+	hc.stats.healthy.Update(atomic.LoadInt64(&hc.localProcessHealthy))
+}
+
+// findNewAndDeleteHost Find deleted and new host in the updated hostSet
+func findNewAndDeleteHost(old, new types.HostSet) ([]types.Host, []types.Host) {
+	newHostsMap := make(map[string]types.Host, new.Size())
+	if new != nil {
+		new.Range(func(newHost types.Host) bool {
+			newHostsMap[newHost.AddressString()] = newHost
+			return true
+		})
+	}
+	// find delete host
+	deleteHosts := make([]types.Host, 0)
+	if old != nil {
+		old.Range(func(oldHost types.Host) bool {
+			_, ok := newHostsMap[oldHost.AddressString()]
+			if ok {
+				delete(newHostsMap, oldHost.AddressString())
+			} else {
+				deleteHosts = append(deleteHosts, oldHost)
+			}
+			return true
+		})
+	}
+	// find new host
+	newHosts := make([]types.Host, 0, len(newHostsMap))
+	for _, newHost := range newHostsMap {
+		newHosts = append(newHosts, newHost)
+	}
+
+	return deleteHosts, newHosts
 }
 
 func (hc *healthChecker) startCheck(host types.Host) {
@@ -134,7 +204,7 @@ func (hc *healthChecker) startCheck(host types.Host) {
 	if _, ok := hc.checkers[addr]; !ok {
 		s := hc.sessionFactory.NewSession(hc.sessionConfig, host)
 		if s == nil {
-			log.DefaultLogger.Errorf("[upstream] [health check] Create Health Check Session Error, Remote Address = %s", addr)
+			log.DefaultLogger.Alertf("healthcheck.session", "[upstream] [health check] Create Health Check Session Error, Remote Address = %s", addr)
 			return
 		}
 		c := newChecker(s, host, hc)
@@ -172,7 +242,9 @@ func (hc *healthChecker) runCallbacks(host types.Host, changed bool, isHealthy b
 func (hc *healthChecker) getCheckInterval() time.Duration {
 	interval := hc.intervalBase
 	if hc.intervalJitter > 0 {
+		hc.mux.Lock()
 		interval += time.Duration(hc.rander.Int63n(int64(hc.intervalJitter)))
+		hc.mux.Unlock()
 	}
 	// TODO: support jitter percentage
 	return interval
@@ -181,7 +253,9 @@ func (hc *healthChecker) getCheckInterval() time.Duration {
 func (hc *healthChecker) incHealthy(host types.Host, changed bool) {
 	hc.stats.success.Inc(1)
 	if changed {
-		log.DefaultLogger.Infof("[upstream] [health check] host %s is healthy", host.AddressString())
+		if log.DefaultLogger.GetLogLevel() >= log.INFO {
+			log.DefaultLogger.Infof("[upstream] [health check] host %s is healthy", host.AddressString())
+		}
 		atomic.AddInt64(&hc.localProcessHealthy, 1)
 	}
 	hc.runCallbacks(host, changed, true)
@@ -191,7 +265,9 @@ func (hc *healthChecker) decHealthy(host types.Host, reason types.FailureType, c
 	hc.stats.failure.Inc(1)
 	if changed {
 		// hc.localProcessHealthy--
-		log.DefaultLogger.Infof("[upstream] [health check] host %s is unhealthy", host.AddressString())
+		if log.DefaultLogger.GetLogLevel() >= log.INFO {
+			log.DefaultLogger.Infof("[upstream] [health check] host %s is unhealthy", host.AddressString())
+		}
 		atomic.AddInt64(&hc.localProcessHealthy, ^int64(0))
 	}
 	switch reason {
@@ -204,4 +280,11 @@ func (hc *healthChecker) decHealthy(host types.Host, reason types.FailureType, c
 	}
 	hc.runCallbacks(host, changed, false)
 
+}
+
+func (hc *healthChecker) log(host types.Host, current_status, changed bool) {
+	if hc.logger == nil {
+		return
+	}
+	hc.logger.Log(host, current_status, changed)
 }

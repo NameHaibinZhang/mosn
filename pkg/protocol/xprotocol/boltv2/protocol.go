@@ -21,10 +21,13 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync/atomic"
+
+	"mosn.io/api"
 
 	"mosn.io/mosn/pkg/log"
-	"mosn.io/mosn/pkg/protocol/xprotocol"
 	"mosn.io/mosn/pkg/protocol/xprotocol/bolt"
+	"mosn.io/mosn/pkg/protocol/xprotocol/internal/registry"
 	"mosn.io/mosn/pkg/types"
 )
 
@@ -67,31 +70,43 @@ import (
  * respstatus: response status
  */
 
-func init() {
-	xprotocol.RegisterProtocol(ProtocolName, &boltv2Protocol{})
-}
-
 type boltv2Protocol struct{}
 
-func (proto *boltv2Protocol) Name() types.ProtocolName {
+func (proto boltv2Protocol) Name() types.ProtocolName {
 	return ProtocolName
 }
 
-func (proto *boltv2Protocol) Encode(ctx context.Context, model interface{}) (types.IoBuffer, error) {
+func (proto boltv2Protocol) Encode(ctx context.Context, model interface{}) (types.IoBuffer, error) {
 	switch frame := model.(type) {
+	case *bolt.Request, *bolt.Response:
+		// FIXME: makes sofarpc protocol common
+		// bolt and boltv2 can be handled success on a same connection
+		// TODO: use internal package to avoid cycle import temporary
+		// makes bolt and boltv2 reuse in same package
+		engine := registry.GetXProtocolCodec(bolt.ProtocolName).NewXProtocol(ctx)
+		return engine.Encode(ctx, model)
 	case *Request:
 		return encodeRequest(ctx, frame)
 	case *Response:
 		return encodeResponse(ctx, frame)
 	default:
 		log.Proxy.Errorf(ctx, "[protocol][bolt] encode with unknown command : %+v", model)
-		return nil, xprotocol.ErrUnknownType
+		return nil, api.ErrUnknownType
 	}
 }
 
-func (proto *boltv2Protocol) Decode(ctx context.Context, data types.IoBuffer) (interface{}, error) {
+func (proto boltv2Protocol) Decode(ctx context.Context, data types.IoBuffer) (interface{}, error) {
+	if data.Len() > 0 {
+		code := data.Bytes()[0]
+		if code == bolt.ProtocolCode { // protocol bolt
+			// TODO: use internal package to avoid cycle import temporary
+			// makes bolt and boltv2 reuse in same package
+			engine := registry.GetXProtocolCodec(bolt.ProtocolName).NewXProtocol(ctx)
+			return engine.Decode(ctx, data)
+		}
+	}
 	if data.Len() >= LessLen {
-		cmdType := data.Bytes()[1]
+		cmdType := data.Bytes()[2]
 
 		switch cmdType {
 		case bolt.CmdTypeRequest:
@@ -110,9 +125,12 @@ func (proto *boltv2Protocol) Decode(ctx context.Context, data types.IoBuffer) (i
 }
 
 // heartbeater
-func (proto *boltv2Protocol) Trigger(requestId uint64) xprotocol.XFrame {
+// set version1 as default 0x01, no crc, use version 1
+// see details in: https://github.com/sofastack/sofa-bolt/blob/master/src/main/java/com/alipay/remoting/rpc/protocol/RpcCommandEncoderV2.java
+func (proto boltv2Protocol) Trigger(ctx context.Context, requestId uint64) api.XFrame {
 	return &Request{
 		RequestHeader: RequestHeader{
+			Version1: ProtocolVersion1,
 			RequestHeader: bolt.RequestHeader{
 				Protocol:  ProtocolCode,
 				CmdType:   bolt.CmdTypeRequest,
@@ -126,15 +144,16 @@ func (proto *boltv2Protocol) Trigger(requestId uint64) xprotocol.XFrame {
 	}
 }
 
-func (proto *boltv2Protocol) Reply(requestId uint64) xprotocol.XRespFrame {
+func (proto boltv2Protocol) Reply(ctx context.Context, request api.XFrame) api.XRespFrame {
 	return &Response{
 		ResponseHeader: ResponseHeader{
+			Version1: ProtocolVersion1,
 			ResponseHeader: bolt.ResponseHeader{
 				Protocol:       ProtocolCode,
 				CmdType:        bolt.CmdTypeResponse,
 				CmdCode:        bolt.CmdCodeHeartbeat,
 				Version:        ProtocolVersion,
-				RequestId:      uint32(requestId),
+				RequestId:      uint32(request.GetRequestId()),
 				Codec:          bolt.Hessian2Serialize,
 				ResponseStatus: bolt.ResponseStatusSuccess,
 			},
@@ -143,9 +162,10 @@ func (proto *boltv2Protocol) Reply(requestId uint64) xprotocol.XRespFrame {
 }
 
 // hijacker
-func (proto *boltv2Protocol) Hijack(statusCode uint32) xprotocol.XRespFrame {
+func (proto boltv2Protocol) Hijack(ctx context.Context, request api.XFrame, statusCode uint32) api.XRespFrame {
 	return &Response{
 		ResponseHeader: ResponseHeader{
+			Version1: ProtocolVersion1,
 			ResponseHeader: bolt.ResponseHeader{
 				Protocol:       ProtocolCode,
 				CmdType:        bolt.CmdTypeResponse,
@@ -159,26 +179,40 @@ func (proto *boltv2Protocol) Hijack(statusCode uint32) xprotocol.XRespFrame {
 	}
 }
 
-func (proto *boltv2Protocol) Mapping(httpStatusCode uint32) uint32 {
+func (proto boltv2Protocol) Mapping(httpStatusCode uint32) uint32 {
 	switch httpStatusCode {
 	case http.StatusOK:
 		return uint32(bolt.ResponseStatusSuccess)
-	case types.RouterUnavailableCode:
+	case api.RouterUnavailableCode:
 		return uint32(bolt.ResponseStatusNoProcessor)
-	case types.NoHealthUpstreamCode:
-		return uint32(bolt.ResponseStatusConnectionClosed)
-	case types.UpstreamOverFlowCode:
+	case api.NoHealthUpstreamCode:
+		return uint32(bolt.ResponseStatusNoProcessor)
+	case api.UpstreamOverFlowCode:
 		return uint32(bolt.ResponseStatusServerThreadpoolBusy)
-	case types.CodecExceptionCode:
+	case api.CodecExceptionCode:
 		//Decode or Encode Error
 		return uint32(bolt.ResponseStatusCodecException)
-	case types.DeserialExceptionCode:
+	case api.DeserialExceptionCode:
 		//Hessian Exception
 		return uint32(bolt.ResponseStatusServerDeserialException)
-	case types.TimeoutExceptionCode:
+	case api.TimeoutExceptionCode:
 		//Response Timeout
 		return uint32(bolt.ResponseStatusTimeout)
 	default:
 		return uint32(bolt.ResponseStatusUnknown)
 	}
+}
+
+// PoolMode returns whether pingpong or multiplex
+func (proto boltv2Protocol) PoolMode() api.PoolMode {
+	return api.Multiplex
+}
+
+func (proto boltv2Protocol) EnableWorkerPool() bool {
+	return true
+}
+
+func (proto boltv2Protocol) GenerateRequestID(streamID *uint64) uint64 {
+	// fix bug for issue: https://github.com/mosn/mosn/issues/2403
+	return uint64(uint32(atomic.AddUint64(streamID, 1)))
 }

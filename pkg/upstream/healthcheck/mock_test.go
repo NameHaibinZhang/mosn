@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"mosn.io/api"
 	"mosn.io/mosn/pkg/types"
 )
 
@@ -55,13 +56,30 @@ func (c *mockCluster) HostSet() types.HostSet {
 	return c.hs
 }
 
+func newMockHostSet(hosts []types.Host) types.HostSet {
+	return &mockHostSet{hosts: hosts}
+}
+
+var _ types.HostSet = &mockHostSet{}
+
 type mockHostSet struct {
-	types.HostSet
 	hosts []types.Host
 }
 
-func (hs *mockHostSet) Hosts() []types.Host {
-	return hs.hosts
+func (hs *mockHostSet) Size() int {
+	return len(hs.hosts)
+}
+
+func (hs *mockHostSet) Get(i int) types.Host {
+	return hs.hosts[i]
+}
+
+func (hs *mockHostSet) Range(f func(types.Host) bool) {
+	for _, h := range hs.hosts {
+		if !f(h) {
+			return
+		}
+	}
 }
 
 type mockHost struct {
@@ -91,14 +109,14 @@ func (h *mockHost) AddressString() string {
 	return h.addr
 }
 
-func (h *mockHost) ClearHealthFlag(flag types.HealthFlag) {
+func (h *mockHost) ClearHealthFlag(flag api.HealthFlag) {
 	h.flag &= ^uint64(flag)
 }
 
-func (h *mockHost) ContainHealthFlag(flag types.HealthFlag) bool {
+func (h *mockHost) ContainHealthFlag(flag api.HealthFlag) bool {
 	return h.flag&uint64(flag) > 0
 }
 
-func (h *mockHost) SetHealthFlag(flag types.HealthFlag) {
+func (h *mockHost) SetHealthFlag(flag api.HealthFlag) {
 	h.flag |= uint64(flag)
 }

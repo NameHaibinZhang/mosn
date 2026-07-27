@@ -4,11 +4,11 @@ import (
 	"testing"
 	"time"
 
-	"mosn.io/mosn/pkg/config/v2"
-	"mosn.io/mosn/pkg/mosn"
+	v2 "mosn.io/mosn/pkg/config/v2"
 	"mosn.io/mosn/pkg/protocol/xprotocol/bolt"
 	"mosn.io/mosn/pkg/server"
 	"mosn.io/mosn/test/util"
+	"mosn.io/mosn/test/util/mosn"
 )
 
 // Test Update stream filters by LDS can effect the connections that created before.
@@ -75,6 +75,5 @@ func updateListener(cfg *v2.MOSNConfig, faultstr string) error {
 	AddFaultInject(cfg, "proxyListener", faultstr)
 	// get config
 	lc := cfg.Servers[0].Listeners[0]
-	// nil listener network filters, nothing changed
-	return server.GetListenerAdapterInstance().AddOrUpdateListener("", &lc, false, false, true)
+	return server.GetListenerAdapterInstance().AddOrUpdateListener("", &lc)
 }

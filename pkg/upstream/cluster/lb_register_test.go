@@ -36,12 +36,15 @@ type headerLB struct {
 func (lb *headerLB) ChooseHost(ctx types.LoadBalancerContext) types.Host {
 	if headers := ctx.DownstreamHeaders(); headers != nil {
 		if value, ok := headers.Get(lb.key); ok {
-			hosts := lb.hostSet.HealthyHosts()
-			for _, h := range hosts {
-				if h.Hostname() == value {
-					return h
+			var choosed types.Host
+			lb.hostSet.Range(func(host types.Host) bool {
+				if host.Health() && host.Hostname() == value {
+					choosed = host
+					return false
 				}
-			}
+				return true
+			})
+			return choosed
 		}
 	}
 	// random choose a host
@@ -49,22 +52,22 @@ func (lb *headerLB) ChooseHost(ctx types.LoadBalancerContext) types.Host {
 }
 
 func (lb *headerLB) IsExistsHosts(metadata api.MetadataMatchCriteria) bool {
-	return len(lb.hostSet.Hosts()) > 0
+	return lb.hostSet.Size() > 0
 }
 
 func (lb *headerLB) HostNum(metadata api.MetadataMatchCriteria) int {
-	return len(lb.hostSet.Hosts())
+	return lb.hostSet.Size()
 }
 
 type headerLBCfg struct {
 	key string
 }
 
-func (cfg *headerLBCfg) newLB(hs types.HostSet) types.LoadBalancer {
+func (cfg *headerLBCfg) newLB(info types.ClusterInfo, hs types.HostSet) types.LoadBalancer {
 	return &headerLB{
 		hostSet: hs,
 		key:     cfg.key,
-		randLB:  newRandomLoadBalancer(hs),
+		randLB:  newRandomLoadBalancer(nil, hs),
 	}
 }
 
@@ -80,7 +83,7 @@ func TestRegisterNewLB(t *testing.T) {
 	// init hosts
 	// reuse subset test config
 	hs := createHostset(exampleHostConfigs())
-	lb := NewLoadBalancer(headerKey, hs)
+	lb := NewLoadBalancer(&clusterInfo{lbType: headerKey}, hs)
 	// expected headerLB
 	if _, ok := lb.(*headerLB); !ok {
 		t.Fatal("load balancer created not expected")
@@ -110,28 +113,44 @@ func TestRegisterNewLB(t *testing.T) {
 	// subset is also valid
 	//  reuse subset test config
 	subsetInfo := NewLBSubsetInfo(exampleSubsetConfig())
-	sublb := newSubsetLoadBalancer(headerKey, hs, newClusterStats("test"), subsetInfo)
-	// choose host is valid
-	// 1. ctx contains subset matched config
-	// 2. ctx contains header with key "hostname"
-	// should choose e1 only
-	for i := 0; i < 100; i++ {
-		host := sublb.ChooseHost(ctx)
-		if host == nil || host.Hostname() != "e1" {
-			t.Fatal("choose host not expected, get: ", host)
+	for name, sublb := range newSubsetLoadBalancers(headerKey, hs, newClusterStats("test"), subsetInfo) {
+		// choose host is valid
+		// 1. ctx contains subset matched config
+		// 2. ctx contains header with key "hostname"
+		// should choose e1 only
+		for i := 0; i < 100; i++ {
+			host := sublb.ChooseHost(ctx)
+			if host == nil || host.Hostname() != "e1" {
+				t.Fatalf("[%s] choose host not expected, get: %s", name, host)
+			}
+		}
+		// choose e1,e2,e5
+		for i := 0; i < 100; i++ {
+			host := sublb.ChooseHost(ctx2)
+			if host == nil {
+				t.Fatalf("[%s] choose host failed", name)
+			}
+			switch host.Hostname() {
+			case "e1", "e2", "e5":
+			default:
+				t.Fatalf("[%s] choose host not expected, get: %s", name, host)
+			}
 		}
 	}
-	// choose e1,e2,e5
-	for i := 0; i < 100; i++ {
-		host := sublb.ChooseHost(ctx2)
-		if host == nil {
-			t.Fatal("choose host failed")
-		}
-		switch host.Hostname() {
-		case "e1", "e2", "e5":
-		default:
-			t.Fatal("choose host not expected, get: ", host)
-		}
+}
+
+// test return maglevLoadBalancer type
+func TestMaglevLoadBalancer(t *testing.T) {
+	set := &mockHostSet{
+		hosts: []types.Host{
+			&mockHost{name: "host"},
+		},
+	}
+	lb := NewLoadBalancer(&clusterInfo{lbType: types.Maglev}, set)
+	if _, ok := lb.(*maglevLoadBalancer); !ok {
+		t.Errorf("lb type should be 'maglevLoadBalancer")
+		t.FailNow()
+
 	}
 }
 
@@ -142,11 +161,11 @@ func TestNewLBCluster(t *testing.T) {
 		ClusterType: v2.SIMPLE_CLUSTER,
 		LbType:      v2.LbType(headerKey), // same as lb type
 	}
-	c := newSimpleCluster(cfg)
+	c := newSimpleCluster(cfg).(*simpleCluster)
 	if c == nil || c.info == nil {
 		t.Fatal("create cluster failed")
 	}
-	if c.info.lbType != headerKey {
+	if c.info.LbType() != headerKey {
 		t.Fatal("create cluster lb type not expected")
 	}
 }

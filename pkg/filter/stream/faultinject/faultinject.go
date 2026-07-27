@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"mosn.io/api"
-	"mosn.io/mosn/pkg/config/v2"
+	v2 "mosn.io/mosn/pkg/config/v2"
 	"mosn.io/mosn/pkg/log"
 	"mosn.io/mosn/pkg/router"
 	"mosn.io/mosn/pkg/types"
@@ -38,13 +38,13 @@ type faultInjectConfig struct {
 	abortStatus  int
 	abortPercent uint32
 	upstream     string
-	headers      []*types.HeaderData
+	headers      types.HeaderMatcher
 }
 
 func makefaultInjectConfig(cfg *v2.StreamFaultInject) *faultInjectConfig {
 	faultConfig := &faultInjectConfig{
 		upstream: cfg.UpstreamCluster,
-		headers:  router.GetRouterHeaders(cfg.Headers),
+		headers:  router.CreateHTTPHeaderMatcher(cfg.Headers),
 	}
 	if cfg.Delay != nil {
 		faultConfig.fixedDelay = cfg.Delay.Delay
@@ -134,7 +134,7 @@ func (f *streamFaultInjectFilter) OnReceive(ctx context.Context, headers api.Hea
 	//if !f.downstreamNodes() {
 	//	return api.StreamHeadersFilterContinue
 	//}
-	if !router.ConfigUtilityInst.MatchHeaders(headers, f.config.headers) {
+	if !f.config.headers.Matches(ctx, headers) {
 		if log.Proxy.GetLogLevel() >= log.DEBUG {
 			log.Proxy.Debugf(f.ctx, "[stream filter] [fault inject] header is not matched, request headers: %v, config headers: %v", headers, f.config.headers)
 		}
@@ -172,9 +172,9 @@ func (f *streamFaultInjectFilter) matchUpstream() bool {
 	if f.config.upstream != "" {
 		if route := f.handler.Route(); route != nil {
 			if log.Proxy.GetLogLevel() >= log.DEBUG {
-				log.Proxy.Debugf(f.ctx, "[stream filter] [fault inject] current cluster name %s, fault inject cluster name %s", route.RouteRule().ClusterName(), f.config.upstream)
+				log.Proxy.Debugf(f.ctx, "[stream filter] [fault inject] current cluster name %s, fault inject cluster name %s", route.RouteRule().ClusterName(f.ctx), f.config.upstream)
 			}
-			return route.RouteRule().ClusterName() == f.config.upstream
+			return route.RouteRule().ClusterName(f.ctx) == f.config.upstream
 		}
 	}
 	if log.Proxy.GetLogLevel() >= log.DEBUG {

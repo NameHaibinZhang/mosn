@@ -22,15 +22,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang/mock/gomock"
+	"github.com/stretchr/testify/assert"
 	"mosn.io/api"
-	"mosn.io/mosn/pkg/config/v2"
+	v2 "mosn.io/mosn/pkg/config/v2"
+	"mosn.io/mosn/pkg/mock"
 	"mosn.io/mosn/pkg/network"
 	"mosn.io/mosn/pkg/protocol"
+	"mosn.io/mosn/pkg/router"
+	"mosn.io/mosn/pkg/streamfilter"
 	"mosn.io/mosn/pkg/trace"
 	"mosn.io/mosn/pkg/types"
 	"mosn.io/pkg/buffer"
-
-	mosnctx "mosn.io/mosn/pkg/context"
+	"mosn.io/pkg/variable"
 )
 
 func TestDownstream_FinishTracing_NotEnable(t *testing.T) {
@@ -60,7 +64,8 @@ func TestDownstream_FinishTracing_Enable_SpanIsNotNil(t *testing.T) {
 	}
 
 	span := trace.Tracer(mockProtocol).Start(context.Background(), nil, time.Now())
-	ctx := mosnctx.WithValue(context.Background(), types.ContextKeyActiveSpan, span)
+	ctx := variable.NewVariableContext(context.Background())
+	_ = variable.Set(ctx, types.VariableTraceSpan, span)
 	requestInfo := &network.RequestInfo{}
 	ds := downStream{context: ctx, requestInfo: requestInfo}
 	header := protocol.CommonHeader{}
@@ -87,7 +92,7 @@ func TestDirectResponse(t *testing.T) {
 	testCases := []struct {
 		client *mockResponseSender
 		route  *mockRoute
-		check  func(t *testing.T, sender *mockResponseSender)
+		check  func(t *testing.T, ctx context.Context, sender *mockResponseSender)
 	}{
 		// without body
 		{
@@ -97,11 +102,11 @@ func TestDirectResponse(t *testing.T) {
 					status: 500,
 				},
 			},
-			check: func(t *testing.T, client *mockResponseSender) {
+			check: func(t *testing.T, ctx context.Context, client *mockResponseSender) {
 				if client.headers == nil {
 					t.Fatal("want to receive a header response")
 				}
-				if code, ok := client.headers.Get(types.HeaderStatus); !ok || code != "500" {
+				if code, err := variable.GetString(ctx, types.VarHeaderStatus); err != nil || code != "500" {
 					t.Error("response status code not expected")
 				}
 			},
@@ -115,11 +120,11 @@ func TestDirectResponse(t *testing.T) {
 					body:   "mock 400 response",
 				},
 			},
-			check: func(t *testing.T, client *mockResponseSender) {
+			check: func(t *testing.T, ctx context.Context, client *mockResponseSender) {
 				if client.headers == nil {
 					t.Fatal("want to receive a header response")
 				}
-				if code, ok := client.headers.Get(types.HeaderStatus); !ok || code != "400" {
+				if code, err := variable.GetString(ctx, types.VarHeaderStatus); err != nil || code != "400" {
 					t.Error("response status code not expected")
 				}
 				if client.data == nil {
@@ -132,6 +137,7 @@ func TestDirectResponse(t *testing.T) {
 		},
 	}
 	for _, tc := range testCases {
+		ctx := variable.NewVariableContext(context.Background())
 		s := &downStream{
 			proxy: &proxy{
 				config: &v2.Proxy{},
@@ -140,32 +146,65 @@ func TestDirectResponse(t *testing.T) {
 						route: tc.route,
 					},
 				},
-				clusterManager: &mockClusterManager{},
-				readCallbacks:  &mockReadFilterCallbacks{},
-				stats:          globalStats,
-				listenerStats:  newListenerStats("test"),
+				clusterManager:      &mockClusterManager{},
+				readCallbacks:       &mockReadFilterCallbacks{},
+				stats:               globalStats,
+				listenerStats:       newListenerStats("test"),
+				serverStreamConn:    &mockServerConn{},
+				routeHandlerFactory: router.DefaultMakeHandler,
 			},
 			responseSender: tc.client,
 			requestInfo:    &network.RequestInfo{},
+			context:        ctx,
 		}
+		s.initStreamFilterChain()
 		// event call Receive Headers
 		// trigger direct response
-		s.OnReceive(context.Background(), protocol.CommonHeader{}, buffer.NewIoBuffer(1), nil)
+		s.OnReceive(ctx, protocol.CommonHeader{}, buffer.NewIoBuffer(1), nil)
 		// check
 		time.Sleep(100 * time.Millisecond)
-		tc.check(t, tc.client)
+		tc.check(t, ctx, tc.client)
 	}
+}
+
+func TestSetDownstreamRouter(t *testing.T) {
+	s := &downStream{
+		context: context.Background(),
+		proxy: &proxy{
+			config: &v2.Proxy{},
+			routersWrapper: &mockRouterWrapper{
+				routers: &mockRouters{
+					route: &mockRoute{},
+				},
+			},
+			clusterManager:      &mockClusterManager{},
+			readCallbacks:       &mockReadFilterCallbacks{},
+			stats:               globalStats,
+			listenerStats:       newListenerStats("test"),
+			serverStreamConn:    &mockServerConn{},
+			routeHandlerFactory: router.DefaultMakeHandler,
+		},
+		responseSender: &mockResponseSender{},
+		requestInfo:    &network.RequestInfo{},
+		snapshot:       &mockClusterSnapshot{},
+	}
+	s.initStreamFilterChain()
+	s.matchRoute()
+	assert.NotNilf(t, s.DownstreamRoute(),
+		"downstream router in context should not be nil")
 }
 
 func TestOnewayHijack(t *testing.T) {
 	initGlobalStats()
 	proxy := &proxy{
-		config:         &v2.Proxy{},
-		routersWrapper: nil,
-		clusterManager: &mockClusterManager{},
-		readCallbacks:  &mockReadFilterCallbacks{},
-		stats:          globalStats,
-		listenerStats:  newListenerStats("test"),
+		config:              &v2.Proxy{},
+		routersWrapper:      nil,
+		clusterManager:      &mockClusterManager{},
+		readCallbacks:       &mockReadFilterCallbacks{},
+		stats:               globalStats,
+		listenerStats:       newListenerStats("test"),
+		serverStreamConn:    &mockServerConn{},
+		routeHandlerFactory: router.DefaultMakeHandler,
 	}
 	s := newActiveStream(context.Background(), proxy, nil, nil)
 
@@ -300,9 +339,149 @@ func TestProcessError(t *testing.T) {
 	}
 
 	s = &downStream{}
-	s.receiverFiltersAgain = true
+	s.receiverFiltersAgainPhase = types.MatchRoute
 	p, e = s.processError(0)
 	if p != types.MatchRoute || e != types.ErrExit {
 		t.Errorf("TestprocessError Error")
+	}
+
+	s = &downStream{}
+	s.receiverFiltersAgainPhase = types.ChooseHost
+	p, e = s.processError(0)
+	if p != types.ChooseHost || e != types.ErrExit {
+		t.Errorf("TestprocessError Error")
+	}
+}
+
+func TestMetadataMatchCriteria(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ctx := variable.NewVariableContext(context.Background())
+
+	cluster := mock.NewMockClusterInfo(ctrl)
+	cluster.EXPECT().Name().AnyTimes()
+
+	routeEntry := mock.NewMockRouteRule(ctrl)
+	routeEntryMeta := router.NewMetadataMatchCriteriaImpl(map[string]string{
+		"a": "b",
+		"b": "bb",
+	})
+	routeEntry.EXPECT().MetadataMatchCriteria(gomock.Any()).AnyTimes().Return(routeEntryMeta)
+
+	requestInfo := &network.RequestInfo{}
+	requestInfo.SetRouteEntry(routeEntry)
+
+	s := &downStream{
+		context:     ctx,
+		requestInfo: requestInfo,
+		cluster:     cluster,
+	}
+
+	assert.Equal(t, s.MetadataMatchCriteria(), routeEntryMeta)
+
+	variable.Set(ctx, types.VarRouterMeta, map[string]string{"a": "aa"})
+	assert.Equal(t, len(s.MetadataMatchCriteria().MetadataMatchCriteria()), 2)
+	assert.Equal(t, s.MetadataMatchCriteria().MetadataMatchCriteria()[0].MetadataValue(), "aa")
+}
+
+func TestRetryEmptyUpstreamHosts(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ctx := variable.NewVariableContext(context.Background())
+
+	cluster := mock.NewMockClusterInfo(ctrl)
+	cluster.EXPECT().Name().AnyTimes()
+
+	clusterManager := mock.NewMockClusterManager(ctrl)
+	clusterManager.EXPECT().ConnPoolForCluster(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().Return(nil, nil)
+
+	responseSender := mock.NewMockStreamSender(ctrl)
+	responseSender.EXPECT().AppendHeaders(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().Return(nil)
+
+	requestInfo := &network.RequestInfo{}
+
+	s := &downStream{
+		ID:      1,
+		context: ctx,
+		cluster: cluster,
+		upstreamRequest: &upstreamRequest{
+			setupRetry: true,
+		},
+		responseSender: responseSender,
+		requestInfo:    requestInfo,
+		proxy: &proxy{
+			config: &v2.Proxy{
+				UpstreamProtocol: "HTTP2",
+			},
+			clusterManager: clusterManager,
+			stats:          globalStats,
+			listenerStats:  newListenerStats("test"),
+		},
+		streamFilterChain: streamFilterChain{
+			DefaultStreamFilterChainImpl: &streamfilter.DefaultStreamFilterChainImpl{},
+		},
+	}
+	s.upstreamRequest.downStream = s
+	phase, _ := s.processError(1)
+	assert.Equal(t, types.Retry, phase)
+	phase = s.receive(ctx, 1, phase)
+	assert.Equal(t, types.UpFilter, phase)
+	phase = s.receive(ctx, 1, phase)
+	assert.Equal(t, types.End, phase)
+	assert.Equal(t, true, s.processDone())
+}
+
+// TestGetUpstreamProtocol
+// 1. default is same as downstream protocol
+// 2. if contextkey is setted, use the contextkey value
+// 3. if the route is setted, use the route value
+func TestGetUpstreamProtocol(t *testing.T) {
+	route := &mockRoute{
+		rule: &mockRouteRule{
+			upstreamProtocol: "HTTP1",
+		},
+	}
+
+	testCases := []struct {
+		ctx              context.Context
+		route            types.Route
+		expectedProtocol types.ProtocolName
+	}{
+		{
+			ctx: func() context.Context {
+				ctx := variable.NewVariableContext(context.Background())
+				_ = variable.Set(ctx, types.VariableUpstreamProtocol, api.ProtocolName("bolt"))
+				return ctx
+			}(),
+			route:            route,
+			expectedProtocol: api.ProtocolName("bolt"),
+		},
+		{
+			ctx:              context.Background(),
+			route:            route,
+			expectedProtocol: api.ProtocolName(route.rule.UpstreamProtocol()),
+		},
+		{
+			ctx:              context.Background(),
+			route:            nil,
+			expectedProtocol: api.ProtocolName("HTTP2"),
+		},
+	}
+
+	for _, tc := range testCases {
+		s := &downStream{
+			ID:      1,
+			context: tc.ctx,
+			route:   tc.route,
+			proxy: &proxy{
+				config: &v2.Proxy{
+					DownstreamProtocol: "HTTP2",
+				},
+			},
+		}
+		currentProtocol := s.getUpstreamProtocol()
+		assert.Equal(t, tc.expectedProtocol, currentProtocol)
 	}
 }

@@ -22,10 +22,14 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	jsoniter "github.com/json-iterator/go"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestClusterConfigParse(t *testing.T) {
@@ -146,6 +150,31 @@ func TestClusterConfigDynamicModeParse(t *testing.T) {
 	}
 }
 
+func TestClusterConfigWithSep(t *testing.T) {
+	testClusterPath := "/tmp/testcluster"
+	clusterName := "cluster/with/sep"
+	os.RemoveAll(testClusterPath)
+	cm := &ClusterManagerConfig{
+		ClusterManagerConfigJson: ClusterManagerConfigJson{
+			ClusterConfigPath: testClusterPath,
+		},
+		Clusters: []Cluster{
+			{
+				Name: clusterName,
+			},
+		},
+	}
+	if _, err := json.Marshal(cm); err != nil {
+		t.Fatal(err)
+	}
+	// expected a file exists
+	data, err := ioutil.ReadFile(filepath.Join(testClusterPath, "cluster_with_sep.json"))
+	if err != nil || !strings.Contains(string(data), clusterName) {
+		t.Fatalf("read cluster file failed, error: %v, data: %s", err, string(data))
+	}
+
+}
+
 func TestClusterConfigConflict(t *testing.T) {
 	mosnConfig := `{
 		"cluster_manager": {
@@ -171,6 +200,7 @@ func TestClusterConfigConflict(t *testing.T) {
 func TestAdminConfig(t *testing.T) {
 	mosnConfig := `{
 		"admin": {
+			"access_log_path": "/dev/null",
 			"address": {
 				"socket_address": {
 					"address": "0.0.0.0",
@@ -183,9 +213,97 @@ func TestAdminConfig(t *testing.T) {
 	if err := json.Unmarshal([]byte(mosnConfig), cfg); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.GetAdmin() == nil {
-		t.Error("no admin config got")
+	adminConfig := cfg.GetAdmin()
+	require.NotNil(t, adminConfig)
+	require.Equal(t, "0.0.0.0", adminConfig.GetAddress())
+	require.Equal(t, uint32(34901), adminConfig.GetPortValue())
+}
+
+func TestMosnXdsMode(t *testing.T) {
+	mosnConfig := `{
+		 "dynamic_resources": {
+			 "ads_config": {
+				 "api_type": "GRPC",
+				 "grpc_services": [
+				 	{
+						"envoy_grpc": {
+							"cluster_name": "xds-grpc"
+						}
+					}
+				 ]
+			 }
+		 },
+		 "static_resources": {
+			 "clusters": [
+			 	{
+					"name": "xds-grpc",
+					"type": "STRICT_DNS",
+					"lb_policy": "ROUND_ROBIN",
+					"hosts": []
+				}
+			 ]
+		 }
+	}`
+	cfg := &MOSNConfig{}
+	if err := json.Unmarshal([]byte(mosnConfig), cfg); err != nil {
+		t.Fatal(err)
 	}
+	if cfg.Mode() != Xds {
+		t.Fatalf("config mode is %d", cfg.Mode())
+	}
+}
+
+func TestMosnMixMode(t *testing.T) {
+	mosnConfig := `{
+		"servers": [
+			{}
+		],
+		"dynamic_resources": {
+		},
+		"static_resources": {}
+	}`
+	cfg := &MOSNConfig{}
+	if err := json.Unmarshal([]byte(mosnConfig), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Mode() != Mix {
+		t.Fatalf("config mode is %d", cfg.Mode())
+	}
+}
+
+func TestSlowStartConfigParse(t *testing.T) {
+	mosnConfig := `{
+		"cluster_manager": {
+			"clusters": [
+				{
+					"name": "cluster0",
+					"slow_start": {
+						"mode": "duration",
+						"slow_start_duration": "10s",
+						"aggression": 2.0,
+						"min_weight_percent": 0.125
+					}
+				},
+				{
+					"name": "cluster1"
+				}
+			]
+		}
+	}`
+	testConfig := &MOSNConfig{}
+	if err := json.Unmarshal([]byte(mosnConfig), testConfig); err != nil {
+		t.Fatal(err)
+	}
+	// verify
+	clusters := testConfig.ClusterManager.Clusters
+	assert.Equal(t, "duration", clusters[0].SlowStart.Mode)
+	assert.Equal(t, 10*time.Second, clusters[0].SlowStart.SlowStartDuration.Duration)
+	assert.Equal(t, 2.0, clusters[0].SlowStart.Aggression)
+	assert.Equal(t, 0.125, clusters[0].SlowStart.MinWeightPercent)
+	assert.Empty(t, clusters[1].SlowStart.Mode)
+	assert.Nil(t, clusters[1].SlowStart.SlowStartDuration)
+	assert.Zero(t, clusters[1].SlowStart.Aggression)
+	assert.Zero(t, clusters[1].SlowStart.MinWeightPercent)
 }
 
 var _iterJson = jsoniter.ConfigCompatibleWithStandardLibrary
@@ -196,7 +314,10 @@ func BenchmarkConfigUnmarshal(b *testing.B) {
 	// assume 5K clusters
 	// test dynamic mode
 	clusterPath := "/tmp/clusters"
+	routerPath := "/tmp/routers/test_router"
 	os.RemoveAll(clusterPath)
+	os.RemoveAll(routerPath)
+	os.MkdirAll(routerPath, 0755)
 	os.MkdirAll(clusterPath, 0755)
 	for i := 0; i < 5000; i++ {
 		c := fmt.Sprintf(`{
@@ -231,6 +352,9 @@ func BenchmarkConfigUnmarshal(b *testing.B) {
 
 func BenchmarkConfigMarshal(b *testing.B) {
 	clusterPath := "/tmp/clusters"
+	routerPath := "/tmp/routers/test_router"
+	os.RemoveAll(routerPath)
+	os.MkdirAll(routerPath, 0755)
 	cfg := ClusterManagerConfig{
 		ClusterManagerConfigJson: ClusterManagerConfigJson{
 			ClusterConfigPath: clusterPath,
@@ -288,12 +412,4 @@ func BenchmarkConfigMarshal(b *testing.B) {
 
 	b.Run("std json testing", stdBench)
 
-}
-
-func TestLoadSdsConfig(t *testing.T) {
-	cfg := &MOSNConfig{}
-	content := []byte(xdsSdsConfig)
-	if err := json.Unmarshal(content, cfg); err != nil {
-		t.Fatal("json unmarshal config failed, ", xdsSdsConfig, "", err)
-	}
 }

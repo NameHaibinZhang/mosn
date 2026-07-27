@@ -18,16 +18,21 @@
 package protocol
 
 import (
+	"context"
+	"errors"
+	"strconv"
+
 	"mosn.io/api"
+	"mosn.io/mosn/pkg/types"
+	"mosn.io/pkg/variable"
 )
 
 // ProtocolName type definition
 const (
-	Auto      api.Protocol = "Auto"
-	SofaRPC   api.Protocol = "SofaRpc"
-	HTTP1     api.Protocol = "Http1"
-	HTTP2     api.Protocol = "Http2"
-	Xprotocol api.Protocol = "X"
+	Auto  api.ProtocolName = "Auto"
+	HTTP1 api.ProtocolName = "Http1" // TODO: move it to protocol/HTTP
+	HTTP2 api.ProtocolName = "Http2" // TODO: move it to protocol/HTTP2
+
 )
 
 // header direction definition
@@ -36,24 +41,18 @@ const (
 	Response = "Response"
 )
 
-// Host key for routing in MOSN Header
-const (
-	MosnHeaderDirection       = "x-mosn-direction" // for protocol convert
-	MosnHeaderHostKey         = "x-mosn-host"
-	MosnHeaderPathKey         = "x-mosn-path"
-	MosnHeaderQueryStringKey  = "x-mosn-querystring"
-	MosnHeaderMethod          = "x-mosn-method"
-	MosnOriginalHeaderPathKey = "x-mosn-original-path"
-)
+func init() {
+	variable.Register(variable.NewStringVariable(types.VarDirection, nil, nil, variable.DefaultStringSetter, 0))
+	variable.Register(variable.NewStringVariable(types.VarScheme, nil, nil, variable.DefaultStringSetter, 0))
+	variable.Register(variable.NewStringVariable(types.VarHost, nil, nil, variable.DefaultStringSetter, 0))
+	variable.Register(variable.NewStringVariable(types.VarPath, nil, nil, variable.DefaultStringSetter, 0))
+	variable.Register(variable.NewStringVariable(types.VarPathOriginal, nil, nil, variable.DefaultStringSetter, 0))
+	variable.Register(variable.NewStringVariable(types.VarQueryString, nil, nil, variable.DefaultStringSetter, 0))
+	variable.Register(variable.NewStringVariable(types.VarMethod, nil, nil, variable.DefaultStringSetter, 0))
+	variable.Register(variable.NewStringVariable(types.VarIstioHeaderHost, nil, nil, variable.DefaultStringSetter, 0))
+}
 
-// Hseader with special meaning in istio
-// todo maybe use ":authority"
-const (
-	IstioHeaderHostKey = "authority"
-)
-
-// TODO: move CommonHeader to common, not only in protocol
-
+// TODO: use pkg.CommonHeader, why not?
 // CommonHeader wrapper for map[string]string
 type CommonHeader map[string]string
 
@@ -109,4 +108,20 @@ func (h CommonHeader) ByteSize() uint64 {
 		size += uint64(len(k) + len(v))
 	}
 	return size
+}
+
+var ErrNoStatusCode = errors.New("headers have no status code")
+
+// GetStatusCodeMapping is a default http mapping implementation, which get
+// status code from variable without any translation.
+type GetStatusCodeMapping struct{}
+
+var _ api.HTTPMapping = (*GetStatusCodeMapping)(nil)
+
+func (m GetStatusCodeMapping) MappingHeaderStatusCode(ctx context.Context, headers api.HeaderMap) (int, error) {
+	status, err := variable.GetString(ctx, types.VarHeaderStatus)
+	if err != nil {
+		return 0, ErrNoStatusCode
+	}
+	return strconv.Atoi(status)
 }

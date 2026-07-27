@@ -21,44 +21,62 @@ import (
 	"context"
 	"strconv"
 
-	"mosn.io/mosn/pkg/variable"
+	"mosn.io/api"
+	"mosn.io/mosn/pkg/protocol"
+	"mosn.io/mosn/pkg/types"
+	"mosn.io/pkg/variable"
 )
 
 const (
 	VarRequestMethod = "http_request_method"
 	VarRequestLength = "http_request_length"
-
-	headerPrefix = "http_header_"
-	headerIndex  = len(headerPrefix)
-	argPrefix    = "http_arg_"
-	argIndex     = len(argPrefix)
-	cookiePrefix = "http_cookie_"
-	cookieIndex  = len(cookiePrefix)
 )
 
 var (
+	headerIndex = len(types.VarPrefixHttpHeader)
+	cookieIndex = len(types.VarPrefixHttpCookie)
+	argIndex    = len(types.VarPrefixHttpArg)
+
 	builtinVariables = []variable.Variable{
-		variable.NewBasicVariable(VarRequestMethod, nil, requestMethodGetter, nil, 0),
-		variable.NewBasicVariable(VarRequestLength, nil, requestLengthGetter, nil, 0),
+		variable.NewStringVariable(types.VarHttpRequestScheme, nil, requestSchemeGetter, nil, 0),
+		variable.NewStringVariable(types.VarHttpRequestMethod, nil, requestMethodGetter, nil, 0),
+		variable.NewStringVariable(types.VarHttpRequestLength, nil, requestLengthGetter, nil, 0),
+		variable.NewStringVariable(types.VarHttpRequestUri, nil, requestUriGetter, nil, 0),
+		variable.NewStringVariable(types.VarHttpRequestPath, nil, requestPathGetter, nil, 0),
+		variable.NewStringVariable(types.VarHttpRequestPathOriginal, nil, requestPathOriginalGetter, nil, 0),
+		variable.NewStringVariable(types.VarHttpRequestArg, nil, requestArgGetter, nil, 0),
 	}
 
 	prefixVariables = []variable.Variable{
-		variable.NewBasicVariable(headerPrefix, nil, httpHeaderGetter, nil, 0),
-		variable.NewBasicVariable(argPrefix, nil, httpArgGetter, nil, 0),
-		variable.NewBasicVariable(cookiePrefix, nil, httpCookieGetter, nil, 0),
+		variable.NewStringVariable(types.VarPrefixHttpHeader, nil, httpHeaderGetter, nil, 0),
+		variable.NewStringVariable(types.VarPrefixHttpArg, nil, httpArgGetter, nil, 0),
+		variable.NewStringVariable(types.VarPrefixHttpCookie, nil, httpCookieGetter, nil, 0),
 	}
 )
 
 func init() {
 	// register built-in variables
 	for idx := range builtinVariables {
-		variable.RegisterVariable(builtinVariables[idx])
+		variable.Register(builtinVariables[idx])
 	}
 
 	// register prefix variables, like header_xxx/arg_xxx/cookie_xxx
 	for idx := range prefixVariables {
-		variable.RegisterPrefixVariable(prefixVariables[idx].Name(), prefixVariables[idx])
+		variable.RegisterPrefix(prefixVariables[idx].Name(), prefixVariables[idx])
 	}
+
+	// register protocol resource
+	variable.RegisterProtocolResource(protocol.HTTP1, api.SCHEME, types.VarProtocolRequestScheme)
+	variable.RegisterProtocolResource(protocol.HTTP1, api.PATH, types.VarProtocolRequestPath)
+	variable.RegisterProtocolResource(protocol.HTTP1, api.URI, types.VarProtocolRequestUri)
+	variable.RegisterProtocolResource(protocol.HTTP1, api.ARG, types.VarProtocolRequestArg)
+	variable.RegisterProtocolResource(protocol.HTTP1, api.COOKIE, types.VarProtocolCookie)
+	variable.RegisterProtocolResource(protocol.HTTP1, api.HEADER, types.VarProtocolRequestHeader)
+}
+
+func requestSchemeGetter(ctx context.Context, value *variable.IndexedValue, data interface{}) (string, error) {
+	buffers := httpBuffersByContext(ctx)
+	return string(buffers.serverRequest.URI().Scheme()), nil
 }
 
 func requestMethodGetter(ctx context.Context, value *variable.IndexedValue, data interface{}) (string, error) {
@@ -74,10 +92,36 @@ func requestLengthGetter(ctx context.Context, value *variable.IndexedValue, data
 
 	length := len(request.Header.Header()) + len(request.Body())
 	if length == 0 {
-		return variable.ValueNotFound, nil
+		return variable.ValueNotFound, variable.ErrValueNotFound
 	}
 
 	return strconv.Itoa(length), nil
+}
+
+func requestPathGetter(ctx context.Context, value *variable.IndexedValue, data interface{}) (string, error) {
+	buffers := httpBuffersByContext(ctx)
+	request := &buffers.serverRequest
+
+	return string(request.URI().Path()), nil
+}
+
+func requestPathOriginalGetter(ctx context.Context, value *variable.IndexedValue, data interface{}) (string, error) {
+	buffers := httpBuffersByContext(ctx)
+	request := &buffers.serverRequest
+
+	return string(request.URI().PathOriginal()), nil
+}
+
+func requestUriGetter(ctx context.Context, value *variable.IndexedValue, data interface{}) (string, error) {
+	buffers := httpBuffersByContext(ctx)
+	request := &buffers.serverRequest
+	return string(request.Header.RequestURI()), nil
+}
+
+func requestArgGetter(ctx context.Context, value *variable.IndexedValue, data interface{}) (string, error) {
+	buffers := httpBuffersByContext(ctx)
+	request := &buffers.serverRequest
+	return request.URI().QueryArgs().String(), nil
 }
 
 func httpHeaderGetter(ctx context.Context, value *variable.IndexedValue, data interface{}) (string, error) {
@@ -88,7 +132,7 @@ func httpHeaderGetter(ctx context.Context, value *variable.IndexedValue, data in
 	headerValue := request.Header.Peek(headerName[headerIndex:])
 	// nil means no kv exists, "" means kv exists, but value is ""
 	if headerValue == nil {
-		return variable.ValueNotFound, nil
+		return variable.ValueNotFound, variable.ErrValueNotFound
 	}
 
 	return string(headerValue), nil
@@ -103,7 +147,7 @@ func httpArgGetter(ctx context.Context, value *variable.IndexedValue, data inter
 	argValue := request.URI().QueryArgs().Peek(argName[argIndex:])
 	// nil means no kv exists, "" means kv exists, but value is ""
 	if argValue == nil {
-		return variable.ValueNotFound, nil
+		return variable.ValueNotFound, variable.ErrValueNotFound
 	}
 
 	return string(argValue), nil
@@ -115,9 +159,9 @@ func httpCookieGetter(ctx context.Context, value *variable.IndexedValue, data in
 
 	cookieName := data.(string)
 	cookieValue := request.Header.Cookie(cookieName[cookieIndex:])
-	// nil means no kv exists, "" means kv exists, but value is ""
+	// error not nil means that no kv exists
 	if cookieValue == nil {
-		return variable.ValueNotFound, nil
+		return variable.ValueNotFound, variable.ErrValueNotFound
 	}
 
 	return string(cookieValue), nil

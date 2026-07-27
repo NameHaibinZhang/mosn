@@ -20,11 +20,17 @@ package mtls
 import (
 	"net"
 	"reflect"
+	"time"
 
-	"mosn.io/mosn/pkg/config/v2"
+	v2 "mosn.io/mosn/pkg/config/v2"
 	"mosn.io/mosn/pkg/log"
 	"mosn.io/mosn/pkg/mtls/crypto/tls"
 	"mosn.io/mosn/pkg/types"
+)
+
+const (
+	serverContextPrefix = "server_"
+	clientContextPrefix = "client_"
 )
 
 type serverContextManager struct {
@@ -47,7 +53,7 @@ func NewTLSServerContextManager(cfg *v2.Listener) (types.TLSContextManager, erro
 	}
 	for _, c := range cfg.FilterChains {
 		for _, tlsCfg := range c.TLSContexts {
-			provider, err := NewProvider(&tlsCfg)
+			provider, err := NewProvider(serverContextPrefix+cfg.Name, &tlsCfg)
 			if err != nil {
 				return nil, err
 			}
@@ -69,7 +75,10 @@ func NewTLSServerContextManager(cfg *v2.Listener) (types.TLSContextManager, erro
 }
 
 func (mng *serverContextManager) GetConfigForClient(info *tls.ClientHelloInfo) (*tls.Config, error) {
-	var defaultProvider types.TLSProvider
+	var (
+		defaultProvider          types.TLSProvider
+		firstALPNMatchedProvider types.TLSProvider
+	)
 	for _, provider := range mng.providers {
 		if !provider.Ready() {
 			continue
@@ -79,16 +88,20 @@ func (mng *serverContextManager) GetConfigForClient(info *tls.ClientHelloInfo) (
 			defaultProvider = provider
 		}
 		if provider.MatchedServerName(info.ServerName) {
-			return provider.GetTLSConfig(false), nil
+			return provider.GetTLSConfigContext(false).Config(), nil
 		}
-		if provider.MatchedALPN(info.SupportedProtos) {
-			return provider.GetTLSConfig(false), nil
+		if firstALPNMatchedProvider == nil && provider.MatchedALPN(info.SupportedProtos) {
+			firstALPNMatchedProvider = provider
 		}
+	}
+	// use first ALPN matched provider when all provider can't match serverName
+	if firstALPNMatchedProvider != nil {
+		return firstALPNMatchedProvider.GetTLSConfigContext(false).Config(), nil
 	}
 	if defaultProvider == nil {
 		return nil, ErrorNoCertConfigure
 	}
-	return defaultProvider.GetTLSConfig(false), nil
+	return defaultProvider.GetTLSConfigContext(false).Config(), nil
 }
 
 func (mng *serverContextManager) Conn(c net.Conn) (net.Conn, error) {
@@ -135,19 +148,24 @@ func (mng *serverContextManager) Enabled() bool {
 type clientContextManager struct {
 	// client support only one certificate
 	provider types.TLSProvider
+	// fallback
+	fallback bool
 }
 
 // NewTLSClientContextManager returns a types.TLSContextManager used in TLS Client
-func NewTLSClientContextManager(cfg *v2.TLSConfig) (types.TLSContextManager, error) {
-	provider, err := NewProvider(cfg)
+func NewTLSClientContextManager(name string, cfg *v2.TLSConfig) (types.TLSClientContextManager, error) {
+	provider, err := NewProvider(clientContextPrefix+name, cfg)
 	if err != nil {
 		return nil, err
 	}
 	mng := &clientContextManager{
 		provider: provider,
+		fallback: cfg.Fallback,
 	}
 	return mng, nil
 }
+
+var handshakeTimeout = types.DefaultConnReadTimeout
 
 func (mng *clientContextManager) Conn(c net.Conn) (net.Conn, error) {
 	if _, ok := c.(*net.TCPConn); !ok {
@@ -156,11 +174,32 @@ func (mng *clientContextManager) Conn(c net.Conn) (net.Conn, error) {
 	if !mng.Enabled() {
 		return c, nil
 	}
+	// make tls connection and try handshake
+	tlsconn := tls.Client(c, mng.provider.GetTLSConfigContext(true).Config())
+	tlsconn.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	if err := tlsconn.Handshake(); err != nil {
+		c.Close() // close the failed connection
+		return nil, err
+	}
+
 	return &TLSConn{
-		tls.Client(c, mng.provider.GetTLSConfig(true)),
+		tlsconn,
 	}, nil
 }
 
 func (mng *clientContextManager) Enabled() bool {
-	return mng.provider != nil && mng.provider.Ready()
+	return mng != nil && mng.provider != nil && mng.provider.Ready()
+}
+
+// if the provider is not ready, the hash value returns nil.
+func (mng *clientContextManager) HashValue() *types.HashValue {
+	if mng == nil || mng.provider == nil {
+		return nil
+	}
+	return mng.provider.GetTLSConfigContext(true).HashValue()
+
+}
+
+func (mng *clientContextManager) Fallback() bool {
+	return mng.fallback
 }

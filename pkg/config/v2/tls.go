@@ -19,9 +19,10 @@ package v2
 
 import (
 	"bytes"
+	"encoding/json"
 
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
-	"github.com/gogo/protobuf/jsonpb"
+	"github.com/golang/protobuf/jsonpb"
+	"github.com/golang/protobuf/proto"
 )
 
 // TLSConfig is a configuration of tls context
@@ -43,6 +44,7 @@ type TLSConfig struct {
 	Ticket            string                 `json:"ticket,omitempty"`
 	Fallback          bool                   `json:"fall_back,omitempty"`
 	ExtendVerify      map[string]interface{} `json:"extend_verify,omitempty"`
+	Callbacks         []string               `json:"callbacks,omitempty"`
 	SdsConfig         *SdsConfig             `json:"sds_source,omitempty"`
 }
 
@@ -52,27 +54,43 @@ type SdsConfig struct {
 }
 
 type SecretConfigWrapper struct {
-	Config *auth.SdsSecretConfig
+	Name      string      `json:"-"`
+	SdsConfig interface{} `json:"-"`
+	raw       SecretConfigWrapperConfig
 }
 
-func (sc SecretConfigWrapper) MarshalJSON() (b []byte, err error) {
-	newData := &bytes.Buffer{}
-	marshaler := &jsonpb.Marshaler{}
-	err = marshaler.Marshal(newData, sc.Config)
-	return newData.Bytes(), err
+func (scw SecretConfigWrapper) MarshalJSON() (b []byte, err error) {
+	// if we build SecretConfigWrapper directly, we should use a proto.Message to build it.
+	if pm, ok := scw.SdsConfig.(proto.Message); ok {
+		var buf bytes.Buffer
+		marshaler := &jsonpb.Marshaler{}
+		_ = marshaler.Marshal(&buf, pm)
+		// use jsonpb format to marshal
+		m := map[string]interface{}{}
+		json.Unmarshal(buf.Bytes(), &m)
+		scw.raw.SdsConfig = m
+	}
+	scw.raw.Name = scw.Name
+	return json.Marshal(scw.raw)
 }
 
-func (sc *SecretConfigWrapper) UnmarshalJSON(b []byte) error {
-	secretConfig := &auth.SdsSecretConfig{}
-	err := jsonpb.Unmarshal(bytes.NewReader(b), secretConfig)
-	if err != nil {
+func (scw *SecretConfigWrapper) UnmarshalJSON(b []byte) error {
+	cfg := SecretConfigWrapperConfig{}
+	if err := json.Unmarshal(b, &cfg); err != nil {
 		return err
 	}
-	sc.Config = secretConfig
+	scw.Name = cfg.Name
+	scw.SdsConfig = cfg.SdsConfig
+	scw.raw = cfg
 	return nil
 }
 
 // Valid checks the whether the SDS Config is valid or not
 func (c *SdsConfig) Valid() bool {
-	return c != nil && c.CertificateConfig != nil && c.ValidationConfig != nil
+	return c != nil && c.CertificateConfig != nil // && c.ValidationConfig != nil // ValidationConfig can be setted to nil
+}
+
+type SecretConfigWrapperConfig struct {
+	Name      string                 `json:"name"`
+	SdsConfig map[string]interface{} `json:"sdsConfig"`
 }

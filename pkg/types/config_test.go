@@ -1,3 +1,4 @@
+//go:build linux || darwin
 // +build linux darwin
 
 /*
@@ -21,7 +22,7 @@ package types
 
 import (
 	"os"
-	"path"
+	"path/filepath"
 	"testing"
 )
 
@@ -29,28 +30,62 @@ func TestInitDefaultPath(t *testing.T) {
 	// init
 	testPath := "/tmp/mosn_default/conf"
 	os.RemoveAll(testPath)
-	testConfigPath := path.Join(testPath, "testfile.json")
+	testConfigPath := filepath.Join(testPath, "testfile.json")
 	// test
-	InitDefaultPath(testConfigPath)
+	InitDefaultPath(testConfigPath, "")
 	// verify
 	// if config is /tmp/mosn_defaulta/conf/config.json
 	// the log should in /tmp/mosn_default/logs/*
 	// the others shoykd in  /tmp/mosn_default/conf*
-	if !(MosnLogBasePath == path.Join("/tmp/mosn_default", "logs") &&
-		MosnConfigPath == path.Join(testPath)) {
+	if !(MosnLogBasePath == filepath.Join("/tmp/mosn_default", "logs") &&
+		MosnConfigPath == filepath.Join(testPath)) {
 		t.Errorf("init default path failed: %s, %s", MosnLogBasePath, MosnConfigPath)
 	}
 	// invalid config should not changed the value
-	InitDefaultPath("")
-	if !(MosnLogBasePath == path.Join("/tmp/mosn_default", "logs") &&
-		MosnConfigPath == path.Join(testPath)) {
+	InitDefaultPath("", "")
+	if !(MosnLogBasePath == filepath.Join("/tmp/mosn_default", "logs") &&
+		MosnConfigPath == filepath.Join(testPath)) {
 		t.Errorf("init default path failed: %s, %s", MosnLogBasePath, MosnConfigPath)
 	}
-	InitDefaultPath("/tmp")
-	if !(MosnLogBasePath == path.Join("/tmp/mosn_default", "logs") &&
-		MosnConfigPath == path.Join(testPath)) {
+	InitDefaultPath("/tmp", "")
+	if !(MosnLogBasePath == filepath.Join("/tmp/mosn_default", "logs") &&
+		MosnConfigPath == filepath.Join(testPath)) {
 		t.Errorf("init default path failed: %s, %s", MosnLogBasePath, MosnConfigPath)
 	}
 	// clean
 	os.RemoveAll(testPath)
+}
+
+func TestInitUDSDir(t *testing.T) {
+	ReconfigureDomainSocket = "/home/admin/mosn/conf/reconfig.sock"
+
+	testCases := []struct {
+		name         string
+		UDSDir       string
+		expectedPath string
+	}{
+		{
+			name:         "empty_dir",
+			UDSDir:       "",
+			expectedPath: "/tmp/mosn/conf/reconfig.sock",
+		},
+		{
+			name:         "normal_dir",
+			UDSDir:       "/tmp/mosn/socks",
+			expectedPath: "/tmp/mosn/socks/reconfig.sock",
+		},
+		{
+			name:         "multiple_separator",
+			UDSDir:       "/tmp//mosn/sock//",
+			expectedPath: "/tmp/mosn/sock/reconfig.sock",
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			InitDefaultPath("/tmp/mosn/conf/", testCase.UDSDir)
+			if ReconfigureDomainSocket != testCase.expectedPath {
+				t.Errorf("expected path: %s, got: %s", testCase.expectedPath, ReconfigureDomainSocket)
+			}
+		})
+	}
 }

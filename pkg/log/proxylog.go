@@ -21,9 +21,9 @@ import (
 	"context"
 	"strconv"
 
-	mosnctx "mosn.io/mosn/pkg/context"
 	"mosn.io/mosn/pkg/types"
 	"mosn.io/pkg/log"
+	"mosn.io/pkg/variable"
 )
 
 // proxyLogger is a default implementation of ContextLogger
@@ -64,6 +64,16 @@ func (l *proxyLogger) Debugf(ctx context.Context, format string, args ...interfa
 	if l.GetLogLevel() >= log.DEBUG {
 		s := l.fomatter(ctx, format)
 		l.ErrorLogger.Debugf(s, args...)
+	}
+}
+
+func (l *proxyLogger) Tracef(ctx context.Context, format string, args ...interface{}) {
+	if l.Disable() {
+		return
+	}
+	if l.GetLogLevel() >= log.TRACE {
+		s := l.fomatter(ctx, format)
+		l.ErrorLogger.Tracef(s, args...)
 	}
 }
 
@@ -112,15 +122,27 @@ func traceInfo(ctx context.Context) string {
 	}
 	cid := "-"
 	tid := "-"
+	uid := "-"
 
-	connId := mosnctx.Get(ctx, types.ContextKeyConnectionID) // uint64
-	if connId != nil {
-		cid = strconv.FormatUint(connId.(uint64), 10)
+	connId, err := variable.Get(ctx, types.VariableConnectionID) // uint64
+	if err == nil && connId != nil {
+		uConnId, ok := connId.(uint64)
+		if ok {
+			cid = strconv.FormatUint(uConnId, 10)
+		}
+
 	}
-	traceId := mosnctx.Get(ctx, types.ContextKeyTraceId) // string
-	if traceId != nil {
+	traceId, err := variable.Get(ctx, types.VariableTraceId) // string
+	if err == nil && traceId != nil {
 		tid = traceId.(string)
 	}
+	upstreamConnectionId, err := variable.Get(ctx, types.VariableUpstreamConnectionID) // uint64
+	if err == nil && upstreamConnectionId != nil {
+		uConnId, ok := upstreamConnectionId.(uint64)
+		if ok {
+			uid = strconv.FormatUint(uConnId, 10)
+		}
+	}
 
-	return "[" + cid + "," + tid + "]"
+	return "[" + cid + "," + uid + "," + tid + "]"
 }

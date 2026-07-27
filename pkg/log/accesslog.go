@@ -20,12 +20,13 @@ package log
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"mosn.io/api"
 	"mosn.io/mosn/pkg/types"
-	"mosn.io/mosn/pkg/variable"
 	"mosn.io/pkg/buffer"
 	"mosn.io/pkg/log"
+	"mosn.io/pkg/variable"
 )
 
 // RequestInfoFuncMap is a map which key is the format-key, value is the func to get corresponding string value
@@ -36,6 +37,8 @@ var (
 	ErrLogFormatUndefined = errors.New("access log format undefined")
 	ErrEmptyVarDef        = errors.New("access log format error: empty variable definition")
 	ErrUnclosedVarDef     = errors.New("access log format error: unclosed variable definition")
+
+	UnknownDefaultValue = "-"
 )
 
 const AccessLogLen = 1 << 8
@@ -51,6 +54,13 @@ func DisableAllAccessLog() {
 	}
 }
 
+func EnableAllAccessLog() {
+	DefaultDisableAccessLog = false
+	for _, lg := range accessLogs {
+		lg.logger.Toggle(false)
+	}
+}
+
 // types.AccessLog
 type accesslog struct {
 	output  string
@@ -59,15 +69,31 @@ type accesslog struct {
 }
 
 type logEntry struct {
-	text     string
-	variable variable.Variable
+	text string
+	name string
+}
+
+// GetVariableValueAsString will convert the variable value to string if founded.
+func GetVariableValueAsString(ctx context.Context, name string) (string, error) {
+	v, err := variable.Get(ctx, name)
+	if err != nil {
+		return "", err
+	}
+	switch s := v.(type) {
+	case string:
+		return s, nil
+	case fmt.Stringer:
+		return s.String(), nil
+	default:
+		return fmt.Sprintf("%v", s), nil
+	}
 }
 
 func (le *logEntry) log(ctx context.Context, buf buffer.IoBuffer) {
 	if le.text != "" {
 		buf.WriteString(le.text)
 	} else {
-		value, err := variable.GetVariableValue(ctx, le.variable.Name())
+		value, err := GetVariableValueAsString(ctx, le.name)
 		if err != nil {
 			buf.WriteString(variable.ValueNotFound)
 		} else {
@@ -109,7 +135,7 @@ func (l *accesslog) Log(ctx context.Context, reqHeaders api.HeaderMap, respHeade
 		return
 	}
 
-	buf := buffer.GetIoBuffer(AccessLogLen)
+	buf := log.GetLogBuffer(AccessLogLen)
 	for idx := range l.entries {
 		l.entries[idx].log(ctx, buf)
 	}
@@ -145,11 +171,14 @@ func parseFormat(format string) ([]*logEntry, error) {
 					}
 
 					// var def ends, add variable
-					varEntry, err := variable.AddVariable(format[lastMark+1 : pos])
+					varName := format[lastMark+1 : pos]
+					_, err := variable.Check(varName)
 					if err != nil {
-						return nil, err
+						// adapt istio unknown fields
+						entries = append(entries, &logEntry{text: UnknownDefaultValue})
+					} else {
+						entries = append(entries, &logEntry{name: varName})
 					}
-					entries = append(entries, &logEntry{variable: varEntry})
 				} else {
 					// ignore empty text
 					if pos > lastMark+1 {

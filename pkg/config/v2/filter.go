@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"time"
 
-	"istio.io/api/mixer/v1/config/client"
 	"mosn.io/api"
 )
 
@@ -42,27 +41,65 @@ type DelayInjectConfig struct {
 	DelayDurationConfig api.DurationConfig `json:"fixed_delay,omitempty"`
 }
 
+type StreamGzip struct {
+	GzipLevel     uint32   `json:"gzip_level,omitempty"`
+	ContentLength uint32   `json:"content_length,omitempty"`
+	ContentType   []string `json:"content_types,omitempty"`
+}
+
+// StreamDSL ...
+type StreamDSL struct {
+	Debug            bool   `json:"debug"` // TODO not implement
+	BeforeRouterDSL  string `json:"before_router_by_dsl"`
+	AfterRouterDSL   string `json:"after_router_by_dsl"`
+	AfterBalancerDSL string `json:"after_balancer_by_dsl"`
+	SendFilterDSL    string `json:"send_filter_by_dsl"`
+	LogDSL           string `json:"log_filter_by_dsl"`
+}
+
 // Listener Filter's Type
 const (
 	ORIGINALDST_LISTENER_FILTER = "original_dst"
 )
+
+type FaultToleranceFilterConfig struct {
+	Enabled               bool `json:"enabled"`
+	ExceptionTypes        map[uint32]bool
+	TimeWindow            int64
+	LeastWindowCount      int64
+	ExceptionRateMultiple float64
+	MaxIpCount            uint64
+	MaxIpRatio            float64
+	RecoverTime           int64
+	TaskSize              int64
+}
 
 // Network Filter's Type
 const (
 	CONNECTION_MANAGER          = "connection_manager" // deprecated
 	DEFAULT_NETWORK_FILTER      = "proxy"
 	TCP_PROXY                   = "tcp_proxy"
+	UDP_PROXY                   = "udp_proxy"
 	FAULT_INJECT_NETWORK_FILTER = "fault_inject"
 	RPC_PROXY                   = "rpc_proxy"
 	X_PROXY                     = "x_proxy"
 	Transcoder                  = "transcoder"
+	GRPC_NETWORK_FILTER         = "grpc"
+	TUNNEL                      = "tunnel"
 )
 
 // Stream Filter's Type
 const (
-	MIXER        = "mixer"
-	FaultStream  = "fault"
-	PayloadLimit = "payload_limit"
+	FaultStream                = "fault"
+	PayloadLimit               = "payload_limit"
+	Gzip                       = "gzip"
+	FaultTolerance             = "fault_tolerance"
+	DSL                        = "dsl"
+	Mirror                     = "mirror"
+	DubboStream                = "dubbo_stream"
+	GoPluginStreamFilterSuffix = "so_plugin"
+	GrpcMetricFilter           = "grpc_metric"
+	IPAccess                   = "ip_access"
 )
 
 // HealthCheckFilter
@@ -101,7 +138,7 @@ type StreamPayloadLimit struct {
 	HttpStatus    int32 `json:"http_status"`
 }
 
-func (f FaultInject) Marshal() (b []byte, err error) {
+func (f FaultInject) MarshalJSON() (b []byte, err error) {
 	f.FaultInjectConfig.DelayDurationConfig.Duration = time.Duration(f.DelayDuration)
 	return json.Marshal(f.FaultInjectConfig)
 }
@@ -127,7 +164,7 @@ type DelayInject struct {
 	Delay time.Duration `json:"-"`
 }
 
-func (d DelayInject) Marshal() (b []byte, err error) {
+func (d DelayInject) MarshalJSON() (b []byte, err error) {
 	d.DelayInjectConfig.DelayDurationConfig.Duration = d.Delay
 	return json.Marshal(d.DelayInjectConfig)
 }
@@ -143,8 +180,4 @@ func (d *DelayInject) UnmarshalJSON(b []byte) error {
 type AbortInject struct {
 	Status  int    `json:"status,omitempty"`
 	Percent uint32 `json:"percentage,omitempty"`
-}
-
-type Mixer struct {
-	client.HttpClientConfig
 }

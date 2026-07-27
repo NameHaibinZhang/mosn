@@ -19,10 +19,12 @@ package v2
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
-	"path"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"mosn.io/api"
@@ -34,10 +36,12 @@ type HealthCheckConfig struct {
 	TimeoutConfig        api.DurationConfig     `json:"timeout,omitempty"`
 	IntervalConfig       api.DurationConfig     `json:"interval,omitempty"`
 	IntervalJitterConfig api.DurationConfig     `json:"interval_jitter,omitempty"`
+	InitialDelaySeconds  api.DurationConfig     `json:"initial_delay_seconds,omitempty"`
 	HealthyThreshold     uint32                 `json:"healthy_threshold,omitempty"`
 	UnhealthyThreshold   uint32                 `json:"unhealthy_threshold,omitempty"`
 	ServiceName          string                 `json:"service_name,omitempty"`
 	SessionConfig        map[string]interface{} `json:"check_config,omitempty"`
+	EventLogPath         string                 `json:"event_log_path,omitempty"`
 	CommonCallbacks      []string               `json:"common_callbacks,omitempty"` // HealthCheck support register some common callbacks that are not related to specific cluster
 }
 
@@ -54,10 +58,12 @@ type ClusterType string
 
 // Group of cluster type
 const (
-	STATIC_CLUSTER  ClusterType = "STATIC"
-	SIMPLE_CLUSTER  ClusterType = "SIMPLE"
-	DYNAMIC_CLUSTER ClusterType = "DYNAMIC"
-	EDS_CLUSTER     ClusterType = "EDS"
+	SIMPLE_CLUSTER      ClusterType = "SIMPLE"
+	STATIC_CLUSTER      ClusterType = "STATIC"
+	DYNAMIC_CLUSTER     ClusterType = "DYNAMIC"
+	EDS_CLUSTER         ClusterType = "EDS"
+	ORIGINALDST_CLUSTER ClusterType = "ORIGINAL_DST"
+	STRICT_DNS_CLUSTER  ClusterType = "STRICT_DNS"
 )
 
 // LbType
@@ -65,8 +71,18 @@ type LbType string
 
 // Group of load balancer type
 const (
-	LB_RANDOM     LbType = "LB_RANDOM"
-	LB_ROUNDROBIN LbType = "LB_ROUNDROBIN"
+	LB_RANDOM        LbType = "LB_RANDOM"
+	LB_ROUNDROBIN    LbType = "LB_ROUNDROBIN"
+	LB_ORIGINAL_DST  LbType = "LB_ORIGINAL_DST"
+	LB_LEAST_REQUEST LbType = "LB_LEAST_REQUEST"
+	LB_MAGLEV        LbType = "LB_MAGLEV"
+)
+
+type DnsLookupFamily string
+
+const (
+	V4Only DnsLookupFamily = "V4_ONLY"
+	V6Only DnsLookupFamily = "V6_ONLY"
 )
 
 // Cluster represents a cluster's information
@@ -76,15 +92,72 @@ type Cluster struct {
 	SubType              string              `json:"sub_type,omitempty"` //not used yet
 	LbType               LbType              `json:"lb_type,omitempty"`
 	MaxRequestPerConn    uint32              `json:"max_request_per_conn,omitempty"`
+	Mark                 uint32              `json:"mark,omitempty"`
 	ConnBufferLimitBytes uint32              `json:"conn_buffer_limit_bytes,omitempty"`
 	CirBreThresholds     CircuitBreakers     `json:"circuit_breakers,omitempty"`
 	HealthCheck          HealthCheck         `json:"health_check,omitempty"`
 	Spec                 ClusterSpecInfo     `json:"spec,omitempty"`
 	LBSubSetConfig       LBSubsetConfig      `json:"lb_subset_config,omitempty"`
 	LBOriDstConfig       LBOriDstConfig      `json:"original_dst_lb_config,omitempty"`
+	ClusterManagerTLS    bool                `json:"cluster_manager_tls,omitempty"`
 	TLS                  TLSConfig           `json:"tls_context,omitempty"`
 	Hosts                []Host              `json:"hosts,omitempty"`
 	ConnectTimeout       *api.DurationConfig `json:"connect_timeout,omitempty"`
+	KeepAlive            KeepAlive           `json:"keepalive,omitempty"`
+	IdleTimeout          *api.DurationConfig `json:"idle_timeout,omitempty"`
+	LbConfig             *LbConfig           `json:"lbconfig,omitempty"`
+	DnsRefreshRate       *api.DurationConfig `json:"dns_refresh_rate,omitempty"`
+	RespectDnsTTL        bool                `json:"respect_dns_ttl,omitempty"`
+	DnsLookupFamily      DnsLookupFamily     `json:"dns_lookup_family,omitempty"`
+	DnsResolverConfig    DnsResolverConfig   `json:"dns_resolvers,omitempty"`
+	DnsResolverFile      string              `json:"dns_resolver_file,omitempty"`
+	DnsResolverPort      string              `json:"dns_resolver_port,omitempty"`
+	SlowStart            SlowStartConfig     `json:"slow_start,omitempty"`
+	ClusterPoolEnable    bool                `json:"cluster_pool_enable,omitempty"`
+}
+
+type DnsResolverConfig struct {
+	Servers  []string `json:"servers,omitempty"`
+	Search   []string `json:"search,omitempty"`
+	Port     string   `json:"port,omitempty"`
+	Ndots    int      `json:"ndots,omitempty"`
+	Timeout  int      `json:"timeout,omitempty"`
+	Attempts int      `json:"attempts,omitempty"`
+}
+
+type SlowStartConfig struct {
+	Mode              string              `json:"mode,omitempty"`
+	SlowStartDuration *api.DurationConfig `json:"slow_start_duration,omitempty"`
+	Aggression        float64             `json:"aggression,omitempty"`
+	MinWeightPercent  float64             `json:"min_weight_percent,omitempty"`
+}
+
+type KeepAliveConfig struct {
+	IntervalConfig api.DurationConfig `json:"interval,omitempty"`
+	TimeoutConfig  api.DurationConfig `json:"timeout,omitempty"`
+}
+
+type KeepAlive struct {
+	KeepAliveConfig
+	Interval time.Duration `json:"-"`
+	Timeout  time.Duration `json:"-"`
+}
+
+// MarshalJSON Marshal implement a json.Marshaler
+func (ka KeepAlive) MarshalJSON() ([]byte, error) {
+	ka.KeepAliveConfig.IntervalConfig.Duration = ka.Interval
+	ka.KeepAliveConfig.TimeoutConfig.Duration = ka.Timeout
+	return json.Marshal(ka.KeepAliveConfig)
+}
+
+// UnmarshalJSON implement a json.Unmarshaler
+func (ka *KeepAlive) UnmarshalJSON(b []byte) error {
+	if err := json.Unmarshal(b, &ka.KeepAliveConfig); err != nil {
+		return err
+	}
+	ka.Timeout = ka.KeepAliveConfig.TimeoutConfig.Duration
+	ka.Interval = ka.KeepAliveConfig.IntervalConfig.Duration
+	return nil
 }
 
 // HealthCheck is a configuration of health check
@@ -176,6 +249,9 @@ type LBSubsetConfig struct {
 type LBOriDstConfig struct {
 	UseHeader  bool   `json:"use_header,omitempty"`
 	HeaderName string `json:"header_name,omitempty"`
+	// ReplaceLocal is true means the load balance will always choose
+	// a host with local address
+	ReplaceLocal bool `json:"replace_local,omitempty"`
 }
 
 // ClusterManagerConfig for making up cluster manager
@@ -186,12 +262,10 @@ type ClusterManagerConfig struct {
 }
 
 type ClusterManagerConfigJson struct {
-	// Note: consider to use standard configure
-	AutoDiscovery bool `json:"auto_discovery,omitempty"`
-	// Note: this is a hack method to realize cluster's  health check which push by registry
-	RegistryUseHealthCheck bool      `json:"registry_use_health_check,omitempty"`
-	ClusterConfigPath      string    `json:"clusters_configs,omitempty"`
-	ClustersJson           []Cluster `json:"clusters,omitempty"`
+	TLSContext        TLSConfig `json:"tls_context,omitempty"`
+	ClusterPoolEnable bool      `json:"cluster_pool_enable,omitempty"`
+	ClusterConfigPath string    `json:"clusters_configs,omitempty"`
+	ClustersJson      []Cluster `json:"clusters,omitempty"`
 }
 
 func (cc *ClusterManagerConfig) UnmarshalJSON(b []byte) error {
@@ -213,7 +287,7 @@ func (cc *ClusterManagerConfig) UnmarshalJSON(b []byte) error {
 			return err
 		}
 		for _, f := range files {
-			fileName := path.Join(cc.ClusterConfigPath, f.Name())
+			fileName := filepath.Join(cc.ClusterConfigPath, f.Name())
 			cluster := Cluster{}
 			e := utils.ReadJsonFile(fileName, &cluster)
 			switch e {
@@ -257,16 +331,22 @@ func (cc ClusterManagerConfig) MarshalJSON() (b []byte, err error) {
 		if err != nil {
 			return nil, err
 		}
+		if len(fileName) > MaxFilePath {
+			fileName = fileName[:MaxFilePath]
+		}
+		fileName = strings.ReplaceAll(fileName, sep, "_")
 		fileName = fileName + ".json"
 		delete(allFiles, fileName)
-		fileName = path.Join(cc.ClusterConfigPath, fileName)
+		fileName = filepath.Join(cc.ClusterConfigPath, fileName)
 		if err := utils.WriteFileSafety(fileName, data, 0644); err != nil {
 			return nil, err
 		}
 	}
 	// delete invalid files
 	for f := range allFiles {
-		os.Remove(path.Join(cc.ClusterConfigPath, f))
+		_ = os.Remove(filepath.Join(cc.ClusterConfigPath, f))
 	}
 	return json.Marshal(cc.ClusterManagerConfigJson)
 }
+
+var NotPercentError = errors.New("not a percent")

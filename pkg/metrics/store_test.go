@@ -23,10 +23,20 @@ import (
 	"testing"
 
 	gometrics "github.com/rcrowley/go-metrics"
+	"github.com/stretchr/testify/assert"
+
 	"mosn.io/mosn/pkg/metrics/shm"
+	"mosn.io/mosn/pkg/types"
 )
 
 func TestGetAll(t *testing.T) {
+	// just for test
+	originPath := types.MosnConfigPath
+	types.MosnConfigPath = "."
+
+	defer func() {
+		types.MosnConfigPath = originPath
+	}()
 	zone := shm.InitMetricsZone("TestGetAll", 10*1024)
 	defer func() {
 		zone.Detach()
@@ -45,6 +55,13 @@ func TestGetAll(t *testing.T) {
 }
 
 func TestExclusionLabels(t *testing.T) {
+	// just for test
+	originPath := types.MosnConfigPath
+	types.MosnConfigPath = "."
+
+	defer func() {
+		types.MosnConfigPath = originPath
+	}()
 	zone := shm.InitMetricsZone("TestExclusionLabels", 10*1024)
 	defer func() {
 		zone.Detach()
@@ -117,6 +134,13 @@ func TestExclusionLabels(t *testing.T) {
 }
 
 func TestExclusionKeys(t *testing.T) {
+	// just for test
+	originPath := types.MosnConfigPath
+	types.MosnConfigPath = "."
+
+	defer func() {
+		types.MosnConfigPath = originPath
+	}()
 	zone := shm.InitMetricsZone("TestExclusionKeys", 10*1024)
 	defer func() {
 		zone.Detach()
@@ -150,7 +174,7 @@ func TestExclusionKeys(t *testing.T) {
 	// Test reject all
 	ResetAll()
 	SetStatsMatcher(true, nil, nil)
-	for key, _ := range testCases {
+	for key := range testCases {
 		gauge := m.Gauge(key)
 		if _, ok := gauge.(gometrics.NilGauge); !ok {
 			t.Errorf("%s expected get nil in reject all scene, bot not", key)
@@ -158,6 +182,56 @@ func TestExclusionKeys(t *testing.T) {
 		// nil/non-nil metrics works well
 		gauge.Update(1)
 	}
+}
+
+func TestLazyFlush(t *testing.T) {
+	LazyFlushMetrics = true
+	defer func() {
+		LazyFlushMetrics = false
+	}()
+	defaultStore.matcher.rejectAll = false
+
+	metrics, _ := NewMetrics("lazy", map[string]string{"lk": "lv"})
+	counter := metrics.Counter("counter")
+	var cn int64 = 10
+	counter.Inc(cn)
+	if counter.Count() != cn {
+		t.Errorf("counter get %d not %d", counter.Count(), cn)
+	}
+
+	gauge := metrics.Gauge("gauge")
+	var gn int64 = 100
+	gauge.Update(gn)
+	if gauge.Value() != gn {
+		t.Errorf("gauge get %d not %d", gauge.Value(), cn)
+	}
+
+	histogram := metrics.Histogram("histogram")
+	var hn int64 = 200
+	histogram.Update(hn)
+	if histogram.Count() != 1 {
+		t.Errorf("histograme get %d not %d", histogram.Count(), 1)
+	}
+
+	metrics.UnregisterAll()
+}
+
+func TestMetrics_Histogram(t *testing.T) {
+	stats, _ := NewMetrics("histogram", map[string]string{"hk": "hv"})
+
+	var h gometrics.Histogram
+	var s gometrics.Sample
+
+	SetSampleType(SampleUniform)
+
+	h = stats.Histogram("uniform")
+	s = h.Sample()
+	assert.IsType(t, &gometrics.UniformSample{}, s)
+
+	SetSampleType(SampleExpDecay)
+	h = stats.Histogram("exp_decay")
+	s = h.Sample()
+	assert.IsType(t, &gometrics.ExpDecaySample{}, s)
 }
 
 func BenchmarkNewMetrics_SameLabels(b *testing.B) {

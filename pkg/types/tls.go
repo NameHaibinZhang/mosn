@@ -18,14 +18,36 @@
 package types
 
 import (
+	"context"
+	"crypto/sha256"
+	"fmt"
 	"net"
 
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
 	"mosn.io/mosn/pkg/mtls/crypto/tls"
 )
 
-// TLSContextManager manages the listener/cluster's tls config
+type HashValue struct {
+	value string
+}
+
+func NewHashValue(v [sha256.Size]byte) *HashValue {
+	return &HashValue{
+		value: fmt.Sprintf("%x", v),
+	}
+}
+
+func (v *HashValue) Equal(hash *HashValue) bool {
+	return v.String() == hash.String()
+}
+
+func (v *HashValue) String() string {
+	if v == nil {
+		return ""
+	}
+	return v.value
+}
+
+// TLSContextManager manages the listener tls config
 type TLSContextManager interface {
 	// Conn handles the connection, makes a connection as tls connection
 	// or keep it as a non-tls connection
@@ -34,12 +56,51 @@ type TLSContextManager interface {
 	Enabled() bool
 }
 
+// TLSClientContextManager manages the cluster tls config
+type TLSClientContextManager interface {
+	TLSContextManager
+	// HashValue returns the tls context manager's config hash value
+	// If tls enabled is false, the hash value returns nil.
+	HashValue() *HashValue
+	// Fallback represents the config fallback
+	Fallback() bool
+}
+
+// TLSConfigContext contains a tls.Config and a HashValue represents the tls.Config
+type TLSConfigContext struct {
+	config *tls.Config
+	hash   *HashValue
+}
+
+func NewTLSConfigContext(cfg *tls.Config, f func(cfg *tls.Config) *HashValue) *TLSConfigContext {
+	return &TLSConfigContext{
+		config: cfg,
+		hash:   f(cfg),
+	}
+}
+
+// Config returns a tls.Config's copy in config context
+func (ctx *TLSConfigContext) Config() *tls.Config {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.config.Clone()
+}
+
+// HashValue returns a hash value's copy in config context
+func (ctx *TLSConfigContext) HashValue() *HashValue {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.hash
+}
+
 // TLSProvider provides a tls config for connection
 // the matched function is used for check whether the connection should use this provider
 type TLSProvider interface {
-	// GetTLSConfig returns the tls config used in connection
+	// GetTLSConfigContext returns the configcontext used in connection
 	// if client is true, return the client mode config, or returns the server mode config
-	GetTLSConfig(client bool) *tls.Config
+	GetTLSConfigContext(client bool) *TLSConfigContext
 	// MatchedServerName checks whether the server name is matched the stored tls certificate
 	MatchedServerName(sn string) bool
 	// MatchedALPN checks whether the ALPN is matched the stored tls certificate
@@ -63,28 +124,20 @@ type SdsSecret struct {
 type SdsUpdateCallbackFunc func(name string, secret *SdsSecret)
 
 type SdsClient interface {
-	AddUpdateCallback(sdsConfig *auth.SdsSecretConfig, callback SdsUpdateCallbackFunc) error
-	DeleteUpdateCallback(sdsConfig *auth.SdsSecretConfig) error
-	SetSecret(name string, secret *auth.Secret)
+	// AddUpdateCallback will send a sds request to get secret and handle the
+	// response by the SdsUpdateCallbackFunc
+	AddUpdateCallback(name string, callback SdsUpdateCallbackFunc) error
+	DeleteUpdateCallback(name string) error
+	// RequireSecret will send a sds request to get secret, the response will be
+	// handled by the SdsUpdateCallbackFunc that added by AddUpdateCallback
+	RequireSecret(name string)
+	// FetchSecret will send a sds request to get secret and wait the response
+	// the response will not be handled by the callback functions
+	FetchSecret(ctx context.Context, name string) (*SdsSecret, error)
+	SecretProvider
 }
 
 type SecretProvider interface {
-	SetSecret(name string, secret *auth.Secret)
-}
-
-func SecretConvert(raw *auth.Secret) *SdsSecret {
-	secret := &SdsSecret{
-		Name: raw.Name,
-	}
-	if validateSecret, ok := raw.Type.(*auth.Secret_ValidationContext); ok {
-		ds := validateSecret.ValidationContext.TrustedCa.Specifier.(*core.DataSource_InlineBytes)
-		secret.ValidationPEM = string(ds.InlineBytes)
-	}
-	if tlsCert, ok := raw.Type.(*auth.Secret_TlsCertificate); ok {
-		certSpec, _ := tlsCert.TlsCertificate.CertificateChain.Specifier.(*core.DataSource_InlineBytes)
-		priKey, _ := tlsCert.TlsCertificate.PrivateKey.Specifier.(*core.DataSource_InlineBytes)
-		secret.CertificatePEM = string(certSpec.InlineBytes)
-		secret.PrivateKeyPEM = string(priKey.InlineBytes)
-	}
-	return secret
+	SetSecret(name string, secret *SdsSecret)
+	AckResponse(resp interface{})
 }

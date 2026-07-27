@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"mosn.io/api"
 	"mosn.io/mosn/pkg/log"
 	"mosn.io/mosn/pkg/types"
 	"mosn.io/pkg/utils"
@@ -65,13 +66,13 @@ var firstInterval = time.Second
 func (c *sessionChecker) Start() {
 	defer func() {
 		if r := recover(); r != nil {
-			log.DefaultLogger.Errorf("[upstream] [health check] [session checker] panic %v\n%s", r, string(debug.Stack()))
+			log.DefaultLogger.Alertf("healthcheck.session", "[upstream] [health check] [session checker] panic %v\n%s", r, string(debug.Stack()))
 		}
 		// stop all the timer when start is finished
 		c.checkTimer.Stop()
 		c.checkTimeout.Stop()
 	}()
-	c.checkTimer = utils.NewTimer(firstInterval, c.OnCheck)
+	c.checkTimer = utils.NewTimer(c.HealthChecker.initialDelay, c.OnCheck)
 	for {
 		select {
 		case <-c.stop:
@@ -122,29 +123,31 @@ func (c *sessionChecker) Stop() {
 func (c *sessionChecker) HandleSuccess() {
 	c.unHealthCount = 0
 	changed := false
-	if c.Host.ContainHealthFlag(types.FAILED_ACTIVE_HC) {
+	if c.Host.ContainHealthFlag(api.FAILED_ACTIVE_HC) {
 		c.healthCount++
 		// check the threshold
 		if c.healthCount == c.HealthChecker.healthyThreshold {
 			changed = true
-			c.Host.ClearHealthFlag(types.FAILED_ACTIVE_HC)
+			c.Host.ClearHealthFlag(api.FAILED_ACTIVE_HC)
 		}
 	}
+	c.HealthChecker.log(c.Host, true, changed)
 	c.HealthChecker.incHealthy(c.Host, changed)
 }
 
 func (c *sessionChecker) HandleFailure(reason types.FailureType) {
 	c.healthCount = 0
 	changed := false
-	if !c.Host.ContainHealthFlag(types.FAILED_ACTIVE_HC) {
+	if !c.Host.ContainHealthFlag(api.FAILED_ACTIVE_HC) {
 		c.unHealthCount++
 		// check the threshold
 		if c.unHealthCount == c.HealthChecker.unhealthyThreshold {
 			changed = true
-			c.Host.SetHealthFlag(types.FAILED_ACTIVE_HC)
+			c.Host.SetHealthFlag(api.FAILED_ACTIVE_HC)
 		}
 	}
 	c.HealthChecker.decHealthy(c.Host, reason, changed)
+	c.HealthChecker.log(c.Host, false, changed)
 }
 
 func (c *sessionChecker) OnCheck() {

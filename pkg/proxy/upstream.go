@@ -20,9 +20,8 @@ package proxy
 import (
 	"container/list"
 	"context"
-	"time"
-
 	"sync/atomic"
+	"time"
 
 	"mosn.io/mosn/pkg/log"
 	"mosn.io/mosn/pkg/protocol"
@@ -40,9 +39,6 @@ type upstreamRequest struct {
 	host          types.Host
 	requestSender types.StreamSender
 	connPool      types.ConnectionPool
-
-	// ~~~ upstream response buf
-	upstreamRespHeaders types.HeaderMap
 
 	//~~~ state
 	sendComplete bool
@@ -81,7 +77,7 @@ func (r *upstreamRequest) OnResetStream(reason types.StreamResetReason) {
 		return
 	}
 
-	r.downStream.resetReason = reason
+	r.downStream.resetReason.Store(reason)
 	r.downStream.sendNotify()
 }
 
@@ -89,9 +85,13 @@ func (r *upstreamRequest) OnDestroyStream() {}
 
 func (r *upstreamRequest) endStream() {
 	upstreamResponseDurationNs := time.Now().Sub(r.startTime).Nanoseconds()
+
 	r.host.HostStats().UpstreamRequestDuration.Update(upstreamResponseDurationNs)
+	r.host.HostStats().UpstreamRequestDurationEWMA.Update(upstreamResponseDurationNs)
 	r.host.HostStats().UpstreamRequestDurationTotal.Inc(upstreamResponseDurationNs)
+
 	r.host.ClusterInfo().Stats().UpstreamRequestDuration.Update(upstreamResponseDurationNs)
+	r.host.ClusterInfo().Stats().UpstreamRequestDurationEWMA.Update(upstreamResponseDurationNs)
 	r.host.ClusterInfo().Stats().UpstreamRequestDurationTotal.Inc(upstreamResponseDurationNs)
 
 	// todo: record upstream process time in request info
@@ -101,12 +101,23 @@ func (r *upstreamRequest) endStream() {
 // Method to decode upstream's response message
 func (r *upstreamRequest) OnReceive(ctx context.Context, headers types.HeaderMap, data types.IoBuffer, trailers types.HeaderMap) {
 	if r.downStream.processDone() || r.setupRetry {
+		if log.Proxy.GetLogLevel() >= log.DEBUG {
+			log.Proxy.Debugf(r.downStream.context, "[proxy] [upstream] [OnReceive] remote addr: %s, processDone: %v, setupRetry: %v",
+				r.host.AddressString(), r.downStream.processDone(), r.setupRetry)
+		}
+		return
+	}
+	if !atomic.CompareAndSwapUint32(&r.downStream.upstreamResponseReceived, 0, 1) {
+		if log.Proxy.GetLogLevel() >= log.DEBUG {
+			log.Proxy.Debugf(r.downStream.context, "[proxy] [upstream] [OnReceive] remote addr: %s, upstreamResponseReceived: %d",
+				r.host.AddressString(), atomic.LoadUint32(&r.downStream.upstreamResponseReceived))
+		}
 		return
 	}
 
 	r.endStream()
 
-	if code, err := protocol.MappingHeaderStatusCode(r.protocol, headers); err == nil {
+	if code, err := protocol.MappingHeaderStatusCode(r.downStream.context, r.protocol, headers); err == nil {
 		r.downStream.requestInfo.SetResponseCode(code)
 	}
 
@@ -116,7 +127,8 @@ func (r *upstreamRequest) OnReceive(ctx context.Context, headers types.HeaderMap
 	r.downStream.downstreamRespTrailers = trailers
 
 	if log.Proxy.GetLogLevel() >= log.DEBUG {
-		log.Proxy.Debugf(r.downStream.context, "[proxy] [upstream] OnReceive headers: %+v, data: %+v, trailers: %+v", headers, data, trailers)
+		log.Proxy.Debugf(r.downStream.context, "[proxy] [upstream] OnReceive")
+		log.Proxy.Tracef(r.downStream.context, "[proxy] [upstream] OnReceive headers: %+v, data: %+v, trailers: %+v", headers, data, trailers)
 	}
 
 	r.downStream.sendNotify()
@@ -159,33 +171,28 @@ func (r *upstreamRequest) appendHeaders(endStream bool) {
 		return
 	}
 	if log.Proxy.GetLogLevel() >= log.DEBUG {
-		log.Proxy.Debugf(r.downStream.context, "[proxy] [upstream] append headers: %+v", r.downStream.downstreamReqHeaders)
+		log.Proxy.Debugf(r.downStream.context, "[proxy] [upstream] append headers")
+		log.Proxy.Tracef(r.downStream.context, "[proxy] [upstream] append headers: %+v", r.downStream.downstreamReqHeaders)
 	}
 	r.sendComplete = endStream
 
+	var (
+		streamSender types.StreamSender
+		failReason   types.PoolFailureReason
+	)
+
 	if r.downStream.oneway {
-		r.connPool.NewStream(r.downStream.context, nil, r)
+		_, streamSender, failReason = r.connPool.NewStream(r.downStream.context, nil)
 	} else {
-		r.connPool.NewStream(r.downStream.context, r, r)
-	}
-}
-
-func (r *upstreamRequest) convertHeader(headers types.HeaderMap) types.HeaderMap {
-	if r.downStream.noConvert {
-		return headers
+		_, streamSender, failReason = r.connPool.NewStream(r.downStream.context, r)
 	}
 
-	dp, up := r.downStream.convertProtocol()
-
-	// need protocol convert
-	if dp != up {
-		if convHeader, err := protocol.ConvertHeader(r.downStream.context, dp, up, headers); err == nil {
-			return convHeader
-		} else {
-			log.Proxy.Warnf(r.downStream.context, "[proxy] [upstream] convert header from %s to %s failed, %s", dp, up, err.Error())
-		}
+	if failReason != "" {
+		r.OnFailure(failReason)
+		return
 	}
-	return headers
+
+	r.OnReady(streamSender)
 }
 
 func (r *upstreamRequest) appendData(endStream bool) {
@@ -193,31 +200,14 @@ func (r *upstreamRequest) appendData(endStream bool) {
 		return
 	}
 	if log.Proxy.GetLogLevel() >= log.DEBUG {
-		log.Proxy.Debugf(r.downStream.context, "[proxy] [upstream] append data:% +v", r.downStream.downstreamReqDataBuf)
+		log.Proxy.Debugf(r.downStream.context, "[proxy] [upstream] append data, len: %v", r.downStream.downstreamReqDataBuf.Len())
+		log.Proxy.Tracef(r.downStream.context, "[proxy] [upstream] append data: %+v", r.downStream.downstreamReqDataBuf)
 	}
 
 	data := r.downStream.downstreamReqDataBuf
 	r.sendComplete = endStream
 	r.dataSent = true
-	r.requestSender.AppendData(r.downStream.context, r.convertData(data), endStream)
-}
-
-func (r *upstreamRequest) convertData(data types.IoBuffer) types.IoBuffer {
-	if r.downStream.noConvert {
-		return data
-	}
-
-	dp, up := r.downStream.convertProtocol()
-
-	// need protocol convert
-	if dp != up {
-		if convData, err := protocol.ConvertData(r.downStream.context, dp, up, data); err == nil {
-			return convData
-		} else {
-			log.Proxy.Warnf(r.downStream.context, "[proxy] [upstream] convert data from %s to %s failed, %s", dp, up, err.Error())
-		}
-	}
-	return data
+	r.requestSender.AppendData(r.downStream.context, data, endStream)
 }
 
 func (r *upstreamRequest) appendTrailers() {
@@ -233,29 +223,11 @@ func (r *upstreamRequest) appendTrailers() {
 	r.requestSender.AppendTrailers(r.downStream.context, trailers)
 }
 
-func (r *upstreamRequest) convertTrailer(trailers types.HeaderMap) types.HeaderMap {
-	if r.downStream.noConvert {
-		return trailers
-	}
-
-	dp, up := r.downStream.convertProtocol()
-
-	// need protocol convert
-	if dp != up {
-		if convTrailer, err := protocol.ConvertTrailer(r.downStream.context, dp, up, trailers); err == nil {
-			return convTrailer
-		} else {
-			log.Proxy.Warnf(r.downStream.context, "[proxy] [upstream] convert header from %s to %s failed, %s", dp, up, err.Error())
-		}
-	}
-	return trailers
-}
-
 // types.PoolEventListener
-func (r *upstreamRequest) OnFailure(reason types.PoolFailureReason, host types.Host) {
+func (r *upstreamRequest) OnFailure(reason types.PoolFailureReason) {
 	var resetReason types.StreamResetReason
 
-	log.Proxy.Errorf(r.downStream.context, "[proxy] [upstream] OnFailure host:%s, reason:%v", host.AddressString(), reason)
+	log.Proxy.Errorf(r.downStream.context, "[proxy] [upstream] OnFailure host:%s, reason:%v", r.host.AddressString(), reason)
 
 	switch reason {
 	case types.Overflow:
@@ -264,24 +236,19 @@ func (r *upstreamRequest) OnFailure(reason types.PoolFailureReason, host types.H
 		resetReason = types.StreamConnectionFailed
 	}
 
-	r.host = host
 	r.OnResetStream(resetReason)
 }
 
-func (r *upstreamRequest) OnReady(sender types.StreamSender, host types.Host) {
+func (r *upstreamRequest) OnReady(sender types.StreamSender) {
 	// debug message for upstream
 	if log.Proxy.GetLogLevel() >= log.DEBUG {
-		log.Proxy.Debugf(r.downStream.context, "[proxy] [upstream] connPool ready, proxyId = %v, host = %s", r.downStream.ID, host.AddressString())
+		log.Proxy.Debugf(r.downStream.context, "[proxy] [upstream] connPool ready, proxyId = %v, host = %s", r.downStream.ID, r.host.AddressString())
 	}
 
 	r.requestSender = sender
-	r.host = host
 	r.requestSender.GetStream().AddEventListener(r)
 	// start a upstream send
 	r.startTime = time.Now()
-
-	r.downStream.requestInfo.OnUpstreamHostSelected(host)
-	r.downStream.requestInfo.SetUpstreamLocalAddress(host.AddressString())
 
 	if trace.IsEnabled() {
 		span := trace.SpanFromContext(r.downStream.context)
@@ -291,7 +258,7 @@ func (r *upstreamRequest) OnReady(sender types.StreamSender, host types.Host) {
 	}
 
 	endStream := r.sendComplete && !r.dataSent && !r.trailerSent
-	r.requestSender.AppendHeaders(r.downStream.context, r.convertHeader(r.downStream.downstreamReqHeaders), endStream)
+	r.requestSender.AppendHeaders(r.downStream.context, r.downStream.downstreamReqHeaders, endStream)
 
 	// todo: check if we get a reset on send headers
 }

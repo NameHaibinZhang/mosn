@@ -19,40 +19,66 @@ package network
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"os"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
 	"mosn.io/api"
-	"mosn.io/mosn/pkg/config/v2"
+	v2 "mosn.io/mosn/pkg/config/v2"
 )
 
 type mockEventListener struct {
+	recvStatus bool
+	stopChan   chan struct{}
 }
 
-func (e *mockEventListener) OnAccept(rawc net.Conn, useOriginalDst bool, oriRemoteAddr net.Addr, c chan api.Connection, buf []byte) {
+func (e *mockEventListener) GetRecvStatus() bool {
+	return e.recvStatus
 }
 
-func (e *mockEventListener) OnNewConnection(ctx context.Context, conn api.Connection) {}
+func (e *mockEventListener) SetRecvStatus(state bool) {
+	e.recvStatus = state
+}
+
+func (e *mockEventListener) OnAccept(rawc net.Conn, useOriginalDst bool, oriRemoteAddr net.Addr, c chan api.Connection, buf []byte, listeners []api.ConnectionEventListener) {
+	e.recvStatus = true
+	rawc.Close()
+}
+
+func (e *mockEventListener) OnNewConnection(ctx context.Context, conn api.Connection) {
+}
+
+func (e *mockEventListener) OnShutdown() {}
 
 func (e *mockEventListener) OnClose() {}
 
-func TestListenerStart(t *testing.T) {
-	addr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:10101")
+func (e *mockEventListener) PreStopHook(ctx context.Context) func() error {
+	return nil
+}
+
+func testBase(t *testing.T, addr net.Addr) {
 	cfg := &v2.Listener{
 		ListenerConfig: v2.ListenerConfig{
 			Name:       "test_listener",
+			Network:    addr.Network(),
 			BindToPort: true,
 		},
 		PerConnBufferLimitBytes: 1024,
 		Addr:                    addr,
 	}
-	ln := NewListener(cfg)
-	ln.SetListenerCallbacks(&mockEventListener{})
+	ln := GetListenerFactory()(cfg)
+
+	el := &mockEventListener{}
+	ln.SetListenerCallbacks(el)
 	go ln.Start(nil, false) // start
-	time.Sleep(time.Second)
+	time.Sleep(3 * time.Second)
 	check := func(t *testing.T) bool {
-		conn, err := net.Dial("tcp", "127.0.0.1:10101")
+		conn, err := net.Dial(addr.Network(), addr.String())
 		if err != nil {
 			t.Logf("dial error: %v", err)
 			return false
@@ -80,7 +106,7 @@ func TestListenerStart(t *testing.T) {
 	if err := ln.Close(nil); err != nil {
 		t.Errorf("Close listener failed, %v", err)
 	}
-	time.Sleep(time.Second)
+	time.Sleep(3 * time.Second)
 	if check(t) {
 		t.Error("listener closed, but still can be dial success")
 	}
@@ -96,5 +122,101 @@ func TestListenerStart(t *testing.T) {
 	if !check(t) {
 		t.Error("listener restart check failed")
 	}
+	ln.Close(context.Background())
+}
 
+func TestListenerTCPStart(t *testing.T) {
+	addr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:10101")
+	testBase(t, addr)
+}
+
+func TestListenerUDPStart(t *testing.T) {
+	addr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:10101")
+	cfg := &v2.Listener{
+		ListenerConfig: v2.ListenerConfig{
+			Name:       "test_listener",
+			Network:    addr.Network(),
+			BindToPort: true,
+			ReusePort:  true,
+		},
+		PerConnBufferLimitBytes: 1024,
+		Addr:                    addr,
+	}
+	ln := GetListenerFactory()(cfg)
+
+	el := &mockEventListener{}
+	ln.SetListenerCallbacks(el)
+	go ln.Start(nil, false) // start
+	time.Sleep(3 * time.Second)
+	listen := func(t *testing.T) bool {
+		conn, err := net.ListenUDP("udp", addr)
+		if conn != nil {
+			conn.Close()
+		}
+		if err != nil {
+			fmt.Errorf("listen to %s failed, %v", addr.String(), err)
+			return false
+		} else {
+			return true
+		}
+
+	}
+	if listen(t) {
+		t.Error("listener start check failed because still can be listened")
+	}
+	// duplicate start, will be ignored, return directly
+	for i := 0; i < 10; i++ {
+		ch := make(chan struct{})
+		go func() {
+			ln.Start(nil, false)
+			close(ch)
+		}()
+		select {
+		case <-ch:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("start not be ignored")
+		}
+	}
+	// close listener
+	if err := ln.Close(nil); err != nil {
+		t.Errorf("Close listener failed, %v", err)
+	}
+	time.Sleep(3 * time.Second)
+	if !listen(t) {
+		t.Error("listener closed, but still can not be listened")
+	}
+	// start, but not restart, will be failed
+	go ln.Start(nil, false)
+	time.Sleep(time.Second)
+	if !listen(t) {
+		t.Error("listener start, but should not be started")
+	}
+	// restart
+	go ln.Start(nil, true)
+	time.Sleep(time.Second)
+	if listen(t) {
+		t.Error("listener restart check failed because it still can be listened")
+	}
+	ln.Close(context.Background())
+}
+
+func TestListenerUDSStart(t *testing.T) {
+	_, err := os.Create("/tmp/test.sock")
+	assert.Nil(t, err)
+	addr, _ := net.ResolveUnixAddr("unix", "/tmp/test.sock")
+	testBase(t, addr)
+}
+
+func TestUDSToFileListener(t *testing.T) {
+	path := "/tmp/test1.sock"
+	syscall.Unlink(path)
+	l, _ := net.Listen("unix", path)
+	f, _ := l.(*net.UnixListener).File()
+	lc, err := net.FileListener(f)
+	if err != nil {
+		t.Errorf("convert to file listener failed, %v", err)
+	}
+	f1, _ := lc.(*net.UnixListener).File()
+	assert.Equal(t, f.Name(), f1.Name())
+	l.Close()
 }

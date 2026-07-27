@@ -20,21 +20,16 @@ package dubbo
 import (
 	"bytes"
 
-	"mosn.io/mosn/pkg/protocol/xprotocol"
-	"mosn.io/mosn/pkg/types"
+	"mosn.io/api"
 )
 
-func init() {
-	xprotocol.RegisterMatcher(ProtocolName, dubboMatcher)
-}
-
 // predicate dubbo header len and compare magic number
-func dubboMatcher(data []byte) types.MatchResult {
+func dubboMatcher(data []byte) api.MatchResult {
 	if len(data) < HeaderLen {
-		return types.MatchAgain
+		return api.MatchAgain
 	}
 	if bytes.Compare(data[MagicIdx:FlagIdx], MagicTag) != 0 {
-		return types.MatchFailed
+		return api.MatchFailed
 	}
-	return types.MatchSuccess
+	return api.MatchSuccess
 }

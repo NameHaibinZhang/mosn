@@ -1,10 +1,10 @@
 package util
 
 import (
+	"net"
 	"time"
 
-	"mosn.io/mosn/pkg/config/v2"
-	"mosn.io/mosn/pkg/protocol"
+	v2 "mosn.io/mosn/pkg/config/v2"
 	"mosn.io/mosn/pkg/types"
 )
 
@@ -32,8 +32,8 @@ func makeFilterChain(proxy *v2.Proxy, routers []v2.Router, cfgName string) v2.Fi
 		RouterConfigurationConfig: v2.RouterConfigurationConfig{
 			RouterConfigName: cfgName,
 		},
-		VirtualHosts: []*v2.VirtualHost{
-			&v2.VirtualHost{
+		VirtualHosts: []v2.VirtualHost{
+			v2.VirtualHost{
 				Name:    "test",
 				Domains: []string{"*"},
 				Routers: routers,
@@ -61,15 +61,19 @@ func NewFilterChain(routerConfigName string, downstream, upstream types.Protocol
 	return makeFilterChain(proxy, routers, routerConfigName)
 }
 
-func NewXProtocolFilterChain(name string, subProtocol types.ProtocolName, routers []v2.Router) v2.FilterChain {
-	proxy := NewProxyFilter(name, protocol.Xprotocol, protocol.Xprotocol)
-	extendConfig := &v2.XProxyExtendConfig{
-		SubProtocol: string(subProtocol),
+func NewFilterChainWithSub(routerConfigName string, downstream, upstream types.ProtocolName, subProtocol types.ProtocolName, routers []v2.Router) v2.FilterChain {
+	proxy := NewProxyFilter(routerConfigName, downstream, upstream)
+	proxy.ExtendConfig = map[string]interface{}{
+		"sub_protocol": string(subProtocol),
 	}
-	extendMap := make(map[string]interface{})
-	data, _ := json.Marshal(extendConfig)
-	json.Unmarshal(data, &extendMap)
-	proxy.ExtendConfig = extendMap
+	return makeFilterChain(proxy, routers, routerConfigName)
+}
+
+func NewXProtocolFilterChain(name string, subProtocol types.ProtocolName, routers []v2.Router) v2.FilterChain {
+	proxy := NewProxyFilter(name, types.ProtocolName("X"), types.ProtocolName("X"))
+	proxy.ExtendConfig = map[string]interface{}{
+		"sub_protocol": string(subProtocol),
+	}
 	return makeFilterChain(proxy, routers, name)
 }
 
@@ -113,12 +117,17 @@ func NewWeightedCluster(name string, hosts []*WeightHost) v2.Cluster {
 }
 
 func NewListener(name, addr string, chains []v2.FilterChain) v2.Listener {
+	nw := "tcp"
+	if _, err := net.ResolveTCPAddr(nw, addr); err != nil {
+		nw = "unix"
+	}
 	return v2.Listener{
 		ListenerConfig: v2.ListenerConfig{
 			Name:         name,
 			AddrConfig:   addr,
 			BindToPort:   true,
 			FilterChains: chains,
+			Network:      nw,
 		},
 	}
 }

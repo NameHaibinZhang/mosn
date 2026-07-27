@@ -62,6 +62,9 @@ func NewRspHeader(rsp *http.Response) *RspHeader {
 // Get value of key
 func (h *HeaderMap) Get(key string) (value string, ok bool) {
 	value = h.H.Get(key)
+	if value == "" {
+		return value, false
+	}
 
 	return value, true
 }
@@ -168,7 +171,7 @@ func DecodeHeader(header types.HeaderMap) types.HeaderMap {
 	case *HeaderMap:
 		in = h.H
 	default:
-		return nil
+		return header.Clone()
 	}
 
 	out := make(map[string]string)

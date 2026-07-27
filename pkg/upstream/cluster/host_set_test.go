@@ -18,8 +18,10 @@
 package cluster
 
 import (
-	"fmt"
+	"strconv"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 
 	"mosn.io/api"
 	"mosn.io/mosn/pkg/types"
@@ -50,70 +52,26 @@ func TestHostSetDistinct(t *testing.T) {
 		hosts = append(hosts, host)
 	}
 	hs.setFinalHost(hosts)
-	if len(hs.Hosts()) != 1 {
+	if hs.Size() != 1 {
 		t.Fatal("hostset distinct failed")
 	}
 }
 
-// Test Refresh healthy hosts
-func TestHostSetRefresh(t *testing.T) {
-	hs := &hostSet{}
-	configs := []simpleMockHostConfig{}
-	for i := 10000; i < 10010; i++ {
-		cfg := simpleMockHostConfig{
-			addr:      fmt.Sprintf("127.0.0.1:%d", i),
-			metaValue: "v1",
-		}
-		configs = append(configs, cfg)
-	}
-	for i := 11000; i < 11010; i++ {
-		cfg := simpleMockHostConfig{
-			addr:      fmt.Sprintf("127.0.0.1:%d", i),
-			metaValue: "v2",
-		}
-		configs = append(configs, cfg)
-	}
+func TestHostSet(t *testing.T) {
 	var hosts []types.Host
-	for _, cfg := range configs {
-		h := newSimpleMockHost(cfg.addr, cfg.metaValue)
-		hosts = append(hosts, h)
-	}
-	hs.setFinalHost(hosts)
-	if !(len(hs.allHosts) == len(hs.healthyHosts) &&
-		len(hs.allHosts) == 20) {
-		t.Fatalf("update host set not expected, %v", hs)
-	}
-	// create subset
-	subV1 := hs.createSubset(func(host types.Host) bool {
-		if host.Metadata()["key"] == "v1" {
-			return true
+	for i := 1; i < 10; i++ {
+		host := &mockHost{
+			addr: "127.0.0." + strconv.Itoa(i),
 		}
-		return false
+		hosts = append(hosts, host)
+	}
+	hs := &hostSet{allHosts: hosts}
+	require.Equal(t, hs.Size(), len(hosts))
+	require.Equal(t, hs.Get(1), hosts[1])
+	i := 0
+	hs.Range(func(host types.Host) bool {
+		i++
+		return true
 	})
-	subV2 := hs.createSubset(func(host types.Host) bool {
-		if host.Metadata()["key"] == "v2" {
-			return true
-		}
-		return false
-	})
-	// verify subv1 and subv2
-	if !(len(subV1.Hosts()) == 10 &&
-		len(subV2.Hosts()) == 10) {
-		t.Fatalf("create sub host set failed")
-	}
-	for _, h := range subV1.Hosts() {
-		if h.Metadata()["key"] != "v1" {
-			t.Fatal("sub host set v1 got unepxected host")
-		}
-	}
-	// mock health check set
-	allHosts := hs.Hosts()
-	host := allHosts[5] // mock one host healthy is changed
-	host.SetHealthFlag(types.FAILED_ACTIVE_HC)
-	hs.refreshHealthHost(host)
-	if !(len(hs.HealthyHosts()) == 19 &&
-		len(subV1.HealthyHosts()) == 9 &&
-		len(subV2.HealthyHosts()) == 10) {
-		t.Fatal("health check state changed not expected")
-	}
+	require.Equal(t, i, 9)
 }

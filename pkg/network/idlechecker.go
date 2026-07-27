@@ -23,14 +23,18 @@ import (
 	"time"
 
 	"mosn.io/api"
+
 	"mosn.io/mosn/pkg/log"
-	"mosn.io/pkg/buffer"
+	"mosn.io/mosn/pkg/types"
 )
 
 // getIdleCount calculates the idle timeout as max idle count.
-func getIdleCount(d time.Duration) uint32 {
-	fd := float64(d)
-	ft := float64(buffer.ConnReadTimeout)
+func getIdleCount(readTimeout time.Duration, idleTimeout time.Duration) uint32 {
+	if readTimeout == 0 {
+		readTimeout = types.DefaultConnReadTimeout
+	}
+	fd := float64(idleTimeout)
+	ft := float64(readTimeout)
 	return uint32(math.Ceil(fd / ft))
 }
 
@@ -45,12 +49,15 @@ type idleChecker struct {
 	lastRead     int64
 }
 
-func (conn *connection) newIdleChecker(timeout time.Duration) {
+func (c *connection) newIdleChecker(readTimeout time.Duration, idleTimeout time.Duration) {
 	checker := &idleChecker{
-		conn:         conn,
-		maxIdleCount: getIdleCount(timeout),
+		conn:         c,
+		maxIdleCount: getIdleCount(readTimeout, idleTimeout),
 	}
-	conn.AddConnectionEventListener(checker)
+	if log.DefaultLogger.GetLogLevel() >= log.DEBUG {
+		log.DefaultLogger.Debugf("new idlechecker: maxIdleCount:%d, conn:%d", checker.maxIdleCount, c.id)
+	}
+	c.AddConnectionEventListener(checker)
 }
 
 func (c *idleChecker) closeConnection() {
@@ -77,7 +84,7 @@ func (c *idleChecker) OnEvent(event api.ConnectionEvent) {
 			return
 		}
 		if log.DefaultLogger.GetLogLevel() >= log.DEBUG {
-			log.DefaultLogger.Debugf("[network] [server idle checker] connection idle %d times", atomic.LoadUint32(&c.idleCount))
+			log.DefaultLogger.Debugf("[network] [server idle checker] connection idle %d times, maxIdleCount:%d", atomic.LoadUint32(&c.idleCount), c.maxIdleCount)
 		}
 	} else {
 		atomic.StoreUint32(&c.idleCount, 1)

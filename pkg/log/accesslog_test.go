@@ -30,10 +30,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"mosn.io/api"
 	"mosn.io/mosn/pkg/types"
-	"mosn.io/mosn/pkg/variable"
 	"mosn.io/pkg/log"
+	"mosn.io/pkg/variable"
 )
 
 func prepareLocalIpv6Ctx() context.Context {
@@ -43,12 +44,14 @@ func prepareLocalIpv6Ctx() context.Context {
 	reqHeaders := map[string]string{
 		"service": "test",
 	}
-	ctx = context.WithValue(ctx, requestHeaderMapKey, reqHeaders)
+	reqHeaderMap := newHeaderMap(reqHeaders)
+	ctx = context.WithValue(ctx, requestHeaderMapKey, reqHeaderMap)
 
 	respHeaders := map[string]string{
-		"Server": "MOSN",
+		"server": "MOSN",
 	}
-	ctx = context.WithValue(ctx, responseHeaderMapKey, respHeaders)
+	respHeaderMap := newHeaderMap(respHeaders)
+	ctx = context.WithValue(ctx, responseHeaderMapKey, respHeaderMap)
 
 	requestInfo := newRequestInfo()
 	requestInfo.SetRequestReceivedDuration(time.Now())
@@ -81,16 +84,23 @@ func TestAccessLog(t *testing.T) {
 
 	ctx := prepareLocalIpv6Ctx()
 	accessLog.Log(ctx, nil, nil, nil)
-	l := "2018/12/14 18:08:33.054 1.329µs 2.00000227s 2048 2048 - 0 126.868µs false 0 127.0.0.1:23456 [2001:db8::68]:12200 127.0.0.1:53242 -\n"
+	//l := "2018/12/14 18:08:33.054 1.329µs 2.00000227s 2048 2048 - 0 126.868µs false 0 127.0.0.1:23456 [2001:db8::68]:12200 127.0.0.1:53242 -\n"
 	time.Sleep(2 * time.Second)
-	f, _ := os.Open(logName)
+	f, err := os.Open(logName)
+	if err != nil {
+		t.Errorf("open log file: %s error: %v", logName, err)
+	}
+	defer f.Close()
 	b := make([]byte, 1024)
 	_, err = f.Read(b)
-	f.Close()
+	if err != nil {
+		t.Errorf("read log file: %s, error: %v", logName, err)
+	}
 	if err != nil {
 		t.Errorf("test accesslog error")
 	}
-	ok, err := regexp.Match("\\d\\d\\d\\d/\\d\\d/\\d\\d .* .* .* 2048 2048 \\- 0 .* false 0 127.0.0.1:23456 \\[2001:db8::68\\]:12200 127.0.0.1:53242 \\-\n", []byte(l))
+	t.Logf("%v", string(b))
+	ok, err := regexp.Match("\\d\\d\\d\\d/\\d\\d/\\d\\d .* .* .* 2048 2048 \\- 0 .* false 0 127.0.0.1:23456 \\[2001:db8::68\\]:12200 127.0.0.1:53242 \\-\n", b)
 
 	if !ok {
 		t.Errorf("test accesslog error %v", err)
@@ -137,6 +147,37 @@ func TestAccessLogWithCustomText(t *testing.T) {
 	}
 }
 
+func TestAccessLogWithPrefixVariables(t *testing.T) {
+	registerTestVarDefs()
+
+	format := "request header:%request_header_service% response header:%response_header_server%"
+	logName := "/tmp/mosn_bench/test_access_log.log"
+	os.Remove(logName)
+	accessLog, err := NewAccessLog(logName, format)
+	if err != nil {
+		t.Errorf(err.Error())
+		return
+	}
+
+	ctx := prepareLocalIpv6Ctx()
+	accessLog.Log(ctx, nil, nil, nil)
+	time.Sleep(2 * time.Second)
+	f, err := os.Open(logName)
+	if err != nil {
+		t.Error("open accesslog error ", err)
+	}
+	b := make([]byte, 1024)
+	n, err := f.Read(b)
+	f.Close()
+	if err != nil {
+		t.Error("read accesslog error ", err)
+	}
+
+	if string(b)[0:n] != "request header:test response header:MOSN\n" {
+		t.Errorf("test accesslog error %s", string(b)[0:n])
+	}
+}
+
 func TestAccessLogWithEmptyVar(t *testing.T) {
 	registerTestVarDefs()
 
@@ -170,7 +211,7 @@ func TestAccessLogDisable(t *testing.T) {
 
 	DefaultDisableAccessLog = true
 	format := types.DefaultAccessLogFormat
-	logName := "/tmp/mosn_accesslog/disbale_access.log"
+	logName := "/tmp/mosn_accesslog/disable_access.log"
 	os.Remove(logName)
 	accessLog, err := NewAccessLog(logName, format)
 	if err != nil {
@@ -178,7 +219,7 @@ func TestAccessLogDisable(t *testing.T) {
 	}
 
 	ctx := prepareLocalIpv6Ctx()
-	// try write disbale access log nothing happened
+	// try write disable access log nothing happened
 	accessLog.Log(ctx, nil, nil, nil)
 	time.Sleep(time.Second)
 	if b, err := ioutil.ReadFile(logName); err != nil || len(b) > 0 {
@@ -229,6 +270,46 @@ func TestAccessLogManage(t *testing.T) {
 			t.Fatal("some access log is enabled")
 		}
 	}
+
+	EnableAllAccessLog()
+	// verify all accesslog is enabled
+	for _, lg := range logs {
+		alg := lg.(*accesslog)
+		if alg.logger.Disable() {
+			t.Fatal("some access log is disabled")
+		}
+	}
+}
+
+func TestGetString(t *testing.T) {
+	strVar := "string"
+	variable.Register(variable.NewStringVariable(strVar, nil, func(ctx context.Context, variableValue *variable.IndexedValue, data interface{}) (s string, err error) {
+		return "value", nil
+	}, nil, 0))
+	stringerVar := "stringer"
+	variable.Register(variable.NewVariable(stringerVar, nil, func(ctx context.Context, variableValue *variable.IndexedValue, data interface{}) (interface{}, error) {
+		// net.IP is a fmt.Stringer
+		return net.ParseIP("127.0.0.1"), nil
+	}, nil, 0))
+	intVar := "int"
+	variable.Register(variable.NewVariable(intVar, nil, func(ctx context.Context, variableValue *variable.IndexedValue, data interface{}) (interface{}, error) {
+		return 100, nil
+	}, nil, 0))
+
+	ctx := variable.NewVariableContext(context.Background())
+	// check
+	v, err := GetVariableValueAsString(ctx, strVar)
+	require.Nil(t, err)
+	require.Equal(t, "value", v)
+
+	v, err = GetVariableValueAsString(ctx, stringerVar)
+	require.Nil(t, err)
+	require.Equal(t, "127.0.0.1", v)
+
+	v, err = GetVariableValueAsString(ctx, intVar)
+	require.Nil(t, err)
+	require.Equal(t, "100", v)
+
 }
 
 func prepareLocalIpv4Ctx() context.Context {
@@ -239,11 +320,15 @@ func prepareLocalIpv4Ctx() context.Context {
 		"service": "test",
 	}
 	ctx = context.WithValue(ctx, requestHeaderMapKey, reqHeaders)
+	reqHeaderMap := newHeaderMap(reqHeaders)
+	ctx = context.WithValue(ctx, requestHeaderMapKey, reqHeaderMap)
 
 	respHeaders := map[string]string{
-		"Server": "MOSN",
+		"server": "MOSN",
 	}
 	ctx = context.WithValue(ctx, responseHeaderMapKey, respHeaders)
+	respHeaderMap := newHeaderMap(respHeaders)
+	ctx = context.WithValue(ctx, responseHeaderMapKey, respHeaderMap)
 
 	requestInfo := newRequestInfo()
 	requestInfo.SetRequestReceivedDuration(time.Now())
@@ -298,9 +383,46 @@ func BenchmarkAccessLogParallel(b *testing.B) {
 	})
 }
 
-// mock_requestInfo
+type mock_HeaderMap struct {
+	headerMap map[string]string
+}
+
+func newHeaderMap(headers map[string]string) api.HeaderMap {
+	return &mock_HeaderMap{
+		headerMap: headers,
+	}
+}
+
+func (h *mock_HeaderMap) Get(key string) (string, bool) {
+	return h.headerMap[key], h.headerMap[key] != ""
+}
+
+func (h *mock_HeaderMap) Set(key, value string) {
+
+}
+
+func (h *mock_HeaderMap) Add(key, value string) {
+
+}
+
+func (h *mock_HeaderMap) Del(key string) {
+
+}
+
+func (h *mock_HeaderMap) Range(f func(key, value string) bool) {
+
+}
+
+func (h *mock_HeaderMap) Clone() api.HeaderMap {
+	return h
+}
+
+func (h *mock_HeaderMap) ByteSize() uint64 {
+	return 0
+}
+
 type mock_requestInfo struct {
-	protocol                 api.Protocol
+	protocol                 api.ProtocolName
 	startTime                time.Time
 	responseFlag             api.ResponseFlag
 	upstreamHost             api.HostInfo
@@ -381,8 +503,12 @@ func (r *mock_requestInfo) SetBytesReceived(bytesReceived uint64) {
 	r.bytesReceived = bytesReceived
 }
 
-func (r *mock_requestInfo) Protocol() api.Protocol {
+func (r *mock_requestInfo) Protocol() api.ProtocolName {
 	return r.protocol
+}
+
+func (r *mock_requestInfo) SetProtocol(p api.ProtocolName) {
+	r.protocol = p
 }
 
 func (r *mock_requestInfo) ResponseCode() int {
@@ -484,37 +610,37 @@ const (
 
 var (
 	builtinVariables = []variable.Variable{
-		variable.NewBasicVariable(varStartTime, nil, startTimeGetter, nil, 0),
-		variable.NewBasicVariable(varRequestReceivedDuration, nil, receivedDurationGetter, nil, 0),
-		variable.NewBasicVariable(varResponseReceivedDuration, nil, responseReceivedDurationGetter, nil, 0),
-		variable.NewBasicVariable(varRequestFinishedDuration, nil, requestFinishedDurationGetter, nil, 0),
-		variable.NewBasicVariable(varBytesSent, nil, bytesSentGetter, nil, 0),
-		variable.NewBasicVariable(varBytesReceived, nil, bytesReceivedGetter, nil, 0),
-		variable.NewBasicVariable(varProtocol, nil, protocolGetter, nil, 0),
-		variable.NewBasicVariable(varResponseCode, nil, responseCodeGetter, nil, 0),
-		variable.NewBasicVariable(varDuration, nil, durationGetter, nil, 0),
-		variable.NewBasicVariable(varResponseFlag, nil, responseFlagGetter, nil, 0),
-		variable.NewBasicVariable(varUpstreamLocalAddress, nil, upstreamLocalAddressGetter, nil, 0),
-		variable.NewBasicVariable(varDownstreamLocalAddress, nil, downstreamLocalAddressGetter, nil, 0),
-		variable.NewBasicVariable(varDownstreamRemoteAddress, nil, downstreamRemoteAddressGetter, nil, 0),
-		variable.NewBasicVariable(varUpstreamHost, nil, upstreamHostGetter, nil, 0),
+		variable.NewStringVariable(varStartTime, nil, startTimeGetter, nil, 0),
+		variable.NewStringVariable(varRequestReceivedDuration, nil, receivedDurationGetter, nil, 0),
+		variable.NewStringVariable(varResponseReceivedDuration, nil, responseReceivedDurationGetter, nil, 0),
+		variable.NewStringVariable(varRequestFinishedDuration, nil, requestFinishedDurationGetter, nil, 0),
+		variable.NewStringVariable(varBytesSent, nil, bytesSentGetter, nil, 0),
+		variable.NewStringVariable(varBytesReceived, nil, bytesReceivedGetter, nil, 0),
+		variable.NewStringVariable(varProtocol, nil, protocolGetter, nil, 0),
+		variable.NewStringVariable(varResponseCode, nil, responseCodeGetter, nil, 0),
+		variable.NewStringVariable(varDuration, nil, durationGetter, nil, 0),
+		variable.NewStringVariable(varResponseFlag, nil, responseFlagGetter, nil, 0),
+		variable.NewStringVariable(varUpstreamLocalAddress, nil, upstreamLocalAddressGetter, nil, 0),
+		variable.NewStringVariable(varDownstreamLocalAddress, nil, downstreamLocalAddressGetter, nil, 0),
+		variable.NewStringVariable(varDownstreamRemoteAddress, nil, downstreamRemoteAddressGetter, nil, 0),
+		variable.NewStringVariable(varUpstreamHost, nil, upstreamHostGetter, nil, 0),
 	}
 
 	prefixVariables = []variable.Variable{
-		variable.NewBasicVariable(reqHeaderPrefix, nil, requestHeaderMapGetter, nil, 0),
-		variable.NewBasicVariable(respHeaderPrefix, nil, responseHeaderMapGetter, nil, 0),
+		variable.NewStringVariable(reqHeaderPrefix, nil, requestHeaderMapGetter, nil, 0),
+		variable.NewStringVariable(respHeaderPrefix, nil, responseHeaderMapGetter, nil, 0),
 	}
 )
 
 func registerTestVarDefs() {
 	// register built-in variables
 	for idx := range builtinVariables {
-		variable.RegisterVariable(builtinVariables[idx])
+		variable.Register(builtinVariables[idx])
 	}
 
 	// register prefix variables, like header_xxx/arg_xxx/cookie_xxx
 	for idx := range prefixVariables {
-		variable.RegisterPrefixVariable(prefixVariables[idx].Name(), prefixVariables[idx])
+		variable.RegisterPrefix(prefixVariables[idx].Name(), prefixVariables[idx])
 	}
 }
 
@@ -568,7 +694,9 @@ func bytesReceivedGetter(ctx context.Context, value *variable.IndexedValue, data
 // get request's protocol type
 func protocolGetter(ctx context.Context, value *variable.IndexedValue, data interface{}) (string, error) {
 	info := ctx.Value(requestInfoKey).(api.RequestInfo)
-
+	if info.Protocol() == "" {
+		return variable.ValueNotFound, variable.ErrValueNotFound
+	}
 	return string(info.Protocol()), nil
 }
 
@@ -613,7 +741,7 @@ func downstreamLocalAddressGetter(ctx context.Context, value *variable.IndexedVa
 		return info.DownstreamLocalAddress().String(), nil
 	}
 
-	return variable.ValueNotFound, nil
+	return variable.ValueNotFound, variable.ErrValueNotFound
 }
 
 // DownstreamRemoteAddressGetter
@@ -625,7 +753,7 @@ func downstreamRemoteAddressGetter(ctx context.Context, value *variable.IndexedV
 		return info.DownstreamRemoteAddress().String(), nil
 	}
 
-	return variable.ValueNotFound, nil
+	return variable.ValueNotFound, variable.ErrValueNotFound
 }
 
 // upstreamHostGetter
@@ -637,7 +765,7 @@ func upstreamHostGetter(ctx context.Context, value *variable.IndexedValue, data 
 		return info.UpstreamHost().Hostname(), nil
 	}
 
-	return variable.ValueNotFound, nil
+	return variable.ValueNotFound, variable.ErrValueNotFound
 }
 
 func requestHeaderMapGetter(ctx context.Context, value *variable.IndexedValue, data interface{}) (string, error) {
@@ -646,10 +774,10 @@ func requestHeaderMapGetter(ctx context.Context, value *variable.IndexedValue, d
 	headerName := data.(string)
 	headerValue, ok := headers.Get(headerName[reqHeaderIndex:])
 	if !ok {
-		return variable.ValueNotFound, nil
+		return variable.ValueNotFound, variable.ErrValueNotFound
 	}
 
-	return string(headerValue), nil
+	return headerValue, nil
 }
 
 func responseHeaderMapGetter(ctx context.Context, value *variable.IndexedValue, data interface{}) (string, error) {
@@ -658,8 +786,8 @@ func responseHeaderMapGetter(ctx context.Context, value *variable.IndexedValue, 
 	headerName := data.(string)
 	headerValue, ok := headers.Get(headerName[respHeaderIndex:])
 	if !ok {
-		return variable.ValueNotFound, nil
+		return variable.ValueNotFound, variable.ErrValueNotFound
 	}
 
-	return string(headerValue), nil
+	return headerValue, nil
 }

@@ -23,6 +23,7 @@ import (
 	metrics "github.com/rcrowley/go-metrics"
 	"mosn.io/api"
 	"mosn.io/mosn/pkg/log"
+	"mosn.io/mosn/pkg/protocol"
 	"mosn.io/mosn/pkg/types"
 	"mosn.io/pkg/buffer"
 )
@@ -41,14 +42,14 @@ type client struct {
 
 // NewStreamClient
 // Create a codecclient used as a client to send/receive stream in a connection
-func NewStreamClient(ctx context.Context, prot api.Protocol, connection types.ClientConnection, host types.Host) Client {
+func NewStreamClient(ctx context.Context, prot api.ProtocolName, connection types.ClientConnection, host types.Host) Client {
 	client := &client{
 		Protocol:   prot,
 		Connection: connection,
 		Host:       host,
 	}
 
-	if factory, ok := streamFactories[prot]; ok {
+	if factory, ok := protocol.GetProtocolStreamFactory(prot); ok {
 		client.ClientStreamConnection = factory.CreateClientStream(ctx, connection, client, client)
 	} else {
 		return nil
@@ -63,7 +64,7 @@ func NewStreamClient(ctx context.Context, prot api.Protocol, connection types.Cl
 
 // NewBiDirectStreamClient
 // Create a bidirectional client used to realize bidirectional communication
-func NewBiDirectStreamClient(ctx context.Context, prot api.Protocol, connection types.ClientConnection, host types.Host,
+func NewBiDirectStreamClient(ctx context.Context, prot api.ProtocolName, connection types.ClientConnection, host types.Host,
 	serverCallbacks types.ServerStreamConnectionEventListener) Client {
 	client := &client{
 		Protocol:   prot,
@@ -71,7 +72,7 @@ func NewBiDirectStreamClient(ctx context.Context, prot api.Protocol, connection 
 		Host:       host,
 	}
 
-	if factory, ok := streamFactories[prot]; ok {
+	if factory, ok := protocol.GetProtocolStreamFactory(prot); ok {
 		client.ClientStreamConnection = factory.CreateBiDirectStream(ctx, connection, client, serverCallbacks)
 	} else {
 		return nil
@@ -112,7 +113,9 @@ func (c *client) SetStreamConnectionEventListener(listener types.StreamConnectio
 func (c *client) NewStream(context context.Context, respReceiver types.StreamReceiveListener) types.StreamSender {
 	// oneway
 	if respReceiver == nil {
-		log.DefaultLogger.Debugf("oneway client NewStream")
+		if log.DefaultLogger.GetLogLevel() >= log.DEBUG {
+			log.DefaultLogger.Debugf("oneway client NewStream")
+		}
 		return c.ClientStreamConnection.NewStream(context, nil)
 	}
 
@@ -138,7 +141,9 @@ func (c *client) OnGoAway() {
 // types.ConnectionEventListener
 // conn callbacks
 func (c *client) OnEvent(event api.ConnectionEvent) {
-	log.DefaultLogger.Debugf("client OnEvent %v, connected %v", event, c.ConnectedFlag)
+	if log.DefaultLogger.GetLogLevel() >= log.DEBUG {
+		log.DefaultLogger.Debugf("client OnEvent %v, connected %v", event, c.ConnectedFlag)
+	}
 	switch event {
 	case api.Connected:
 		c.ConnectedFlag = true

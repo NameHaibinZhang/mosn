@@ -22,11 +22,12 @@ import (
 	"errors"
 	"io/ioutil"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"mosn.io/mosn/pkg/config/v2"
+	v2 "mosn.io/mosn/pkg/config/v2"
 	"mosn.io/mosn/pkg/mtls/certtool"
 	"mosn.io/mosn/pkg/mtls/crypto/tls"
 )
@@ -80,7 +81,7 @@ func (hook *testConfigHooks) verifyPeerCertificate(roots *x509.CertPool, certs [
 		return err
 	}
 	if leaf.Subject.CommonName != hook.PassCommonName {
-		return errors.New("common name miss match")
+		return errors.New("tls: common name miss match")
 	}
 	return nil
 }
@@ -152,7 +153,7 @@ func (f *testConfigHooksFactory) CreateConfigHooks(config map[string]interface{}
 
 func TestMain(m *testing.M) {
 	Register(testType, &testConfigHooksFactory{})
-	m.Run()
+	os.Exit(m.Run())
 }
 
 // TestTLSExtensionsVerifyClient tests server allow request with certificate's common name is client only
@@ -191,9 +192,8 @@ func TestTLSExtensionsVerifyClient(t *testing.T) {
 	}
 	server := MockServer{
 		Mng: ctxMng,
-		t:   t,
 	}
-	server.GoListenAndServe(t)
+	server.GoListenAndServe()
 	defer server.Close()
 	time.Sleep(time.Second) //wait server start
 	testCases := []struct {
@@ -222,13 +222,13 @@ func TestTLSExtensionsVerifyClient(t *testing.T) {
 			t.Errorf("#%d create client certificate error %v", i, err)
 			continue
 		}
-		cltMng, err := NewTLSClientContextManager(cfg)
+		cltMng, err := NewTLSClientContextManager("", cfg)
 		if err != nil {
 			t.Errorf("#%d create client context manager failed %v", i, err)
 			continue
 		}
 
-		resp, err := MockClient(t, server.Addr, cltMng)
+		resp, err := MockClient(server.Addr, cltMng)
 		if !tc.Pass(resp, err) {
 			t.Errorf("#%d verify failed", i)
 		}
@@ -291,9 +291,8 @@ func TestTestTLSExtensionsVerifyServer(t *testing.T) {
 	}
 	server := MockServer{
 		Mng: ctxMng,
-		t:   t,
 	}
-	server.GoListenAndServe(t)
+	server.GoListenAndServe()
 	defer server.Close()
 	time.Sleep(time.Second) //wait server start
 	clientConfig, err := clientInfo.CreateCertConfig()
@@ -305,13 +304,13 @@ func TestTestTLSExtensionsVerifyServer(t *testing.T) {
 	clientConfig.ExtendVerify = extendVerify
 	for i, tc := range testCases {
 		clientConfig.ServerName = tc.Info.DNS
-		cltMng, err := NewTLSClientContextManager(clientConfig)
+		cltMng, err := NewTLSClientContextManager("", clientConfig)
 		if err != nil {
 			t.Errorf("create client context manager failed %v", err)
 			return
 		}
 
-		resp, err := MockClient(t, server.Addr, cltMng)
+		resp, err := MockClient(server.Addr, cltMng)
 		if !tc.Pass(resp, err) {
 			t.Errorf("#%d verify failed", i)
 		}
@@ -327,12 +326,12 @@ func TestTestTLSExtensionsVerifyServer(t *testing.T) {
 	}
 	for i, tc := range testCases {
 		skipConfig.ServerName = tc.Info.DNS
-		skipMng, err := NewTLSClientContextManager(skipConfig)
+		skipMng, err := NewTLSClientContextManager("", skipConfig)
 		if err != nil {
 			t.Errorf("create client context manager failed %v", err)
 			return
 		}
-		resp, err := MockClient(t, server.Addr, skipMng)
+		resp, err := MockClient(server.Addr, skipMng)
 		// ignore the case, must be pass
 		if !pass(resp, err) {
 			t.Errorf("#%d skip verify failed", i)

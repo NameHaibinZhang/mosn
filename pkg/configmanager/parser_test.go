@@ -19,11 +19,17 @@ package configmanager
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
+	"os"
 	"reflect"
+	"runtime"
 	"testing"
 
-	"mosn.io/mosn/pkg/config/v2"
+	"github.com/stretchr/testify/assert"
+	"mosn.io/api"
+	v2 "mosn.io/mosn/pkg/config/v2"
 )
 
 type testCallback struct {
@@ -39,9 +45,8 @@ var cb testCallback
 
 func TestMain(m *testing.M) {
 	RegisterConfigParsedListener(ParseCallbackKeyCluster, cb.ParsedCallback)
-	RegisterConfigParsedListener(ParseCallbackKeyServiceRgtInfo, cb.ParsedCallback)
 	RegisterConfigParsedListener(ParseCallbackKeyProcessor, cb.ParsedCallback)
-	m.Run()
+	os.Exit(m.Run())
 }
 
 var mockedFilterChains = `
@@ -100,7 +105,7 @@ func TestParseClusterConfig(t *testing.T) {
 	clusters, clMap := ParseClusterConfig([]v2.Cluster{cluster})
 	c := clusters[0]
 	for _, h := range c.Hosts {
-		if h.Weight < MinHostWeight || h.Weight > MaxHostWeight {
+		if h.Weight < v2.MinHostWeight || h.Weight > v2.MaxHostWeight {
 			t.Error("unexpected host weight")
 		}
 	}
@@ -115,14 +120,14 @@ func TestParseClusterConfig(t *testing.T) {
 		t.Error("no callback")
 	}
 
-	if c.MaxRequestPerConn != DefaultMaxRequestPerConn {
+	if c.MaxRequestPerConn != v2.DefaultMaxRequestPerConn {
 		t.Errorf("Expect cluster.MaxRequestPerConn default value %d but got %d",
-			DefaultMaxRequestPerConn, c.MaxRequestPerConn)
+			v2.DefaultMaxRequestPerConn, c.MaxRequestPerConn)
 	}
 
-	if c.ConnBufferLimitBytes != DefaultConnBufferLimitBytes {
+	if c.ConnBufferLimitBytes != v2.DefaultConnBufferLimitBytes {
 		t.Errorf("Expect cluster.ConnBufferLimitBytes default value%d, but got %d",
-			DefaultConnBufferLimitBytes, c.ConnBufferLimitBytes)
+			v2.DefaultConnBufferLimitBytes, c.ConnBufferLimitBytes)
 	}
 }
 func TestParseListenerConfig(t *testing.T) {
@@ -133,26 +138,68 @@ func TestParseListenerConfig(t *testing.T) {
 		t.Error(err)
 		return
 	}
+	unixListener, err := net.Listen("unix", "/tmp/parse.sock")
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	defer unixListener.Close()
 	defer listener.Close()
 	tcpListener := listener.(*net.TCPListener)
 	var inherit []net.Listener
-	inherit = append(inherit, tcpListener)
+	inherit = append(inherit, tcpListener, unixListener)
 
-	lc := &v2.Listener{
-		ListenerConfig: v2.ListenerConfig{
-			AddrConfig: tcpListener.Addr().String(),
-		},
+	lnStr := fmt.Sprintf(`{
+		"address": "%s"
+	}`, tcpListener.Addr().String())
+	lc := &v2.Listener{}
+	if err := json.Unmarshal([]byte(lnStr), lc); err != nil {
+		t.Fatalf("listener config init failed: %v", err)
 	}
-	ln := ParseListenerConfig(lc, inherit)
+	var inheritPacketConn []net.PacketConn
+	ln := ParseListenerConfig(lc, inherit, inheritPacketConn)
 	if !(ln.Addr != nil &&
 		ln.Addr.String() == tcpListener.Addr().String() &&
 		ln.PerConnBufferLimitBytes == 1<<15 &&
 		ln.InheritListener != nil) {
-		t.Error("listener parse unexpected")
-		t.Log(ln.Addr.String(), ln.InheritListener != nil)
+		t.Errorf("listener parse unexpected, listener: %+v", ln)
 	}
-	if inherit[0] != nil {
-		t.Error("no inherit listener")
+
+	// test unix
+	lnStr = fmt.Sprintf(`{
+		"address": "%s"
+	}`, unixListener.Addr().String())
+	unixlc := &v2.Listener{}
+	unixlc.Network = "unix"
+	if err := json.Unmarshal([]byte(lnStr), unixlc); err != nil {
+		t.Fatalf("listener config init failed: %v", err)
+	}
+
+	ln = ParseListenerConfig(unixlc, inherit, inheritPacketConn)
+
+	ll := unixListener.(*net.UnixListener)
+	if !(ln.Addr != nil &&
+		ln.Addr.String() == ll.Addr().String() &&
+		ln.PerConnBufferLimitBytes == 1<<15 &&
+		ln.InheritListener != nil) {
+		t.Errorf("listener parse unexpected, listener: %+v", ln)
+	}
+}
+
+func TestParseListenerUDP(t *testing.T) {
+	packetconn, err := net.ListenPacket("udp", "127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("listen packet error: %v", err)
+	}
+	ln := ParseListenerConfig(&v2.Listener{
+		ListenerConfig: v2.ListenerConfig{
+			AddrConfig: "127.0.0.1:8080",
+			Network:    "udp",
+		},
+	}, nil, []net.PacketConn{packetconn})
+	if !(ln.Addr != nil &&
+		ln.InheritPacketConn != nil) {
+		t.Fatalf("parse udp listener failed: %+v", ln)
 	}
 }
 
@@ -185,10 +232,109 @@ func TestParseRouterConfig(t *testing.T) {
 	}
 }
 
-func TestParseServiceRegistry(t *testing.T) {
-	cb.Count = 0
-	ParseServiceRegistry(v2.ServiceRegistryInfo{})
-	if cb.Count != 1 {
-		t.Error("no callback")
+func TestParseServerConfigWithAutoProc(t *testing.T) {
+	// set env
+	nc := runtime.NumCPU()
+	// register cb
+	cb := 0
+	RegisterConfigParsedListener(ParseCallbackKeyProcessor, func(data interface{}, endParsing bool) error {
+		p := data.(int)
+		cb = p
+		return nil
+	})
+	_ = ParseServerConfig(&v2.ServerConfig{
+		Processor: "auto",
+	})
+	if cb != nc {
+		t.Fatalf("processor callback should be called, cb:%d, numcpu:%d", cb, nc)
 	}
+}
+
+func TestParseServerConfig(t *testing.T) {
+	// set env
+	os.Setenv("GOMAXPROCS", "1")
+	// register cb
+	cb := 0
+	RegisterConfigParsedListener(ParseCallbackKeyProcessor, func(data interface{}, endParsing bool) error {
+		p := data.(int)
+		cb = p
+		return nil
+	})
+	_ = ParseServerConfig(&v2.ServerConfig{
+		Processor: 0,
+	})
+	if cb != 1 {
+		t.Fatal("processor callback should be called")
+	}
+}
+
+func TestListenerFilterFactories(t *testing.T) {
+	api.RegisterListener("test1", func(cfg map[string]interface{}) (api.ListenerFilterChainFactory, error) {
+		return &struct {
+			api.ListenerFilterChainFactory
+		}{}, nil
+	})
+	api.RegisterListener("test_nil", func(cfg map[string]interface{}) (api.ListenerFilterChainFactory, error) {
+		return nil, nil
+	})
+	api.RegisterListener("test_error", func(cfg map[string]interface{}) (api.ListenerFilterChainFactory, error) {
+		return nil, errors.New("invalid factory create")
+	})
+
+	config := []v2.Filter{
+		{Type: "test1"},
+		{Type: "test_error"},
+		{Type: "not registered"},
+		{Type: "test_nil"},
+	}
+
+	factoryNil := GetListenerFilterFactories("test_listener")
+	assert.Nil(t, factoryNil)
+
+	factory := AddOrUpdateListenerFilterFactories("test_listener", config)
+	factory1 := GetListenerFilterFactories("test_listener")
+	factory2 := GetListenerFilterFactories("test_listener")
+	assert.NotNil(t, factory)
+	assert.Equal(t, factory, factory1)
+	assert.Equal(t, factory1, factory2)
+}
+
+func TestNetworkFilterFactories(t *testing.T) {
+	api.RegisterNetwork("test_nil", func(cfg map[string]interface{}) (api.NetworkFilterChainFactory, error) {
+		return nil, nil
+	})
+	api.RegisterNetwork("test1", func(cfg map[string]interface{}) (api.NetworkFilterChainFactory, error) {
+		return &struct{ api.NetworkFilterChainFactory }{}, nil
+	})
+	api.RegisterNetwork("test_error", func(cfg map[string]interface{}) (api.NetworkFilterChainFactory, error) {
+		return nil, errors.New("invalid factory create")
+	})
+
+	listenerConfig := &v2.Listener{
+		ListenerConfig: v2.ListenerConfig{
+			Name: "test_listener",
+			FilterChains: []v2.FilterChain{
+				{
+					FilterChainConfig: v2.FilterChainConfig{
+						Filters: []v2.Filter{
+							{Type: "test1"},
+							{Type: "test_error"},
+							{Type: "not registered"},
+							{Type: "test_nil"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	factoryNil := GetNetworkFilterFactories("test_listener")
+	assert.Nil(t, factoryNil)
+
+	factory := AddOrUpdateNetworkFilterFactories("test_listener", listenerConfig)
+	factory1 := GetNetworkFilterFactories("test_listener")
+	factory2 := GetNetworkFilterFactories("test_listener")
+	assert.NotNil(t, factory)
+	assert.Equal(t, factory, factory1)
+	assert.Equal(t, factory1, factory2)
 }

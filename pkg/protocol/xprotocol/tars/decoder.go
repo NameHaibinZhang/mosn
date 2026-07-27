@@ -20,18 +20,19 @@ package tars
 import (
 	"context"
 
-	"github.com/TarsCloud/TarsGo/tars"
+	tarsprotocol "github.com/TarsCloud/TarsGo/tars/protocol"
 	"github.com/TarsCloud/TarsGo/tars/protocol/codec"
 	"github.com/TarsCloud/TarsGo/tars/protocol/res/requestf"
 	"github.com/juju/errors"
 	"mosn.io/mosn/pkg/protocol"
 	"mosn.io/mosn/pkg/types"
 	"mosn.io/pkg/buffer"
+	"mosn.io/pkg/variable"
 )
 
 func decodeRequest(ctx context.Context, data types.IoBuffer) (cmd interface{}, err error) {
-	frameLen, status := tars.TarsRequest(data.Bytes())
-	if status != tars.PACKAGE_FULL {
+	frameLen, status := tarsprotocol.TarsRequest(data.Bytes())
+	if status != tarsprotocol.PACKAGE_FULL {
 		return nil, errors.New("tars request status fail")
 	}
 	req := &Request{
@@ -41,6 +42,10 @@ func decodeRequest(ctx context.Context, data types.IoBuffer) (cmd interface{}, e
 	copy(rawData, data.Bytes()[:frameLen])
 	req.rawData = rawData
 	req.data = buffer.NewIoBufferBytes(req.rawData)
+
+	// notice: read-only!!! do not modify the raw data!!!
+	variable.Set(ctx, types.VarRequestRawData, req.rawData)
+
 	reqPacket := &requestf.RequestPacket{}
 	is := codec.NewReader(data.Bytes())
 	err = reqPacket.ReadFrom(is)
@@ -58,8 +63,8 @@ func decodeRequest(ctx context.Context, data types.IoBuffer) (cmd interface{}, e
 }
 
 func decodeResponse(ctx context.Context, data types.IoBuffer) (cmd interface{}, err error) {
-	frameLen, status := tars.TarsRequest(data.Bytes())
-	if status != tars.PACKAGE_FULL {
+	frameLen, status := tarsprotocol.TarsRequest(data.Bytes())
+	if status != tarsprotocol.PACKAGE_FULL {
 		return nil, errors.New("tars request status fail")
 	}
 	resp := &Response{}
@@ -67,6 +72,10 @@ func decodeResponse(ctx context.Context, data types.IoBuffer) (cmd interface{}, 
 	copy(rawData, data.Bytes()[:frameLen])
 	resp.rawData = rawData
 	resp.data = buffer.NewIoBufferBytes(resp.rawData)
+
+	// notice: read-only!!! do not modify the raw data!!!
+	variable.Set(ctx, types.VarResponseRawData, resp.rawData)
+
 	respPacket := &requestf.ResponsePacket{}
 	is := codec.NewReader(data.Bytes())
 	err = respPacket.ReadFrom(is)

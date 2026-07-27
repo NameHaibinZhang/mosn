@@ -9,15 +9,17 @@ import (
 	"testing"
 	"time"
 
+	"mosn.io/mosn/pkg/network"
+
 	"mosn.io/mosn/pkg/configmanager"
 	"mosn.io/mosn/pkg/log"
-	"mosn.io/mosn/pkg/mosn"
 	"mosn.io/mosn/pkg/protocol/xprotocol/bolt"
 	"mosn.io/mosn/pkg/server"
 	_ "mosn.io/mosn/pkg/stream/xprotocol"
 	"mosn.io/mosn/pkg/types"
 	"mosn.io/mosn/test/integrate"
 	"mosn.io/mosn/test/util"
+	"mosn.io/mosn/test/util/mosn"
 )
 
 // client - mesh - mesh - server
@@ -27,7 +29,7 @@ func forkTransferMesh(tc *integrate.XTestCase) int {
 
 	execSpec := &syscall.ProcAttr{
 		Env:   os.Environ(),
-		Files: append([]uintptr{os.Stdin.Fd(), os.Stdout.Fd(), os.Stderr.Fd()}),
+		Files: []uintptr{os.Stdin.Fd(), os.Stdout.Fd(), os.Stderr.Fd()},
 	}
 
 	// Fork exec the new version of your server
@@ -46,7 +48,7 @@ func startTransferMesh(t *testing.T, tc *integrate.XTestCase) {
 	types.TransferStatsDomainSocket = "/tmp/stats.sock"
 	types.TransferListenDomainSocket = "/tmp/listen.sock"
 	types.ReconfigureDomainSocket = "/tmp/reconfig.sock"
-	cfg := util.CreateXProtocolMesh(tc.ClientMeshAddr, tc.ServerMeshAddr, tc.SubProtocol, []string{tc.AppServer.Addr()}, true)
+	cfg := util.CreateXProtocolMesh(tc.ClientMeshAddr, tc.ServerMeshAddr, tc.SubProtocol, []string{tc.AppServer.Addr()}, false)
 
 	configPath := "/tmp/transfer.json"
 	os.Remove(configPath)
@@ -78,12 +80,18 @@ func startTransferServer(tc *integrate.XTestCase) {
 }
 
 func TestTransfer(t *testing.T) {
+	// todo: fix this?
+	// netpoll mode does not support transfer
+	if network.UseNetpollMode {
+		return
+	}
 
 	appaddr := "127.0.0.1:8080"
 
 	tc := integrate.NewXTestCase(t, bolt.ProtocolName, util.NewRPCServer(t, appaddr, bolt.ProtocolName))
 
-	tc.ClientMeshAddr = "127.0.0.1:12101"
+	os.Remove("/tmp/client.sock")
+	tc.ClientMeshAddr = "/tmp/client.sock"
 	tc.ServerMeshAddr = "127.0.0.1:12102"
 
 	if os.Getenv("_MOSN_TEST_TRANSFER") == "true" {

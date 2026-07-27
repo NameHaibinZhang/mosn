@@ -33,10 +33,22 @@ import (
 //           1              * | 1                          1 | 1          *
 //   clusterManager --------- cluster  --------- --------- hostSet------hosts
 
+// CDS Handler for cluster manager
+type ClusterUpdateHandler func(oldCluster, newCluster Cluster)
+
+// EDS Handler for cluster manager
+type HostUpdateHandler func(cluster Cluster, hostConfigs []v2.Host)
+
 // ClusterManager manages connection pools and load balancing for upstream clusters.
 type ClusterManager interface {
 	// Add or update a cluster via API.
 	AddOrUpdatePrimaryCluster(cluster v2.Cluster) error
+
+	// AddOrUpdateClusterAndHost
+	AddOrUpdateClusterAndHost(cluster v2.Cluster, hosts []v2.Host) error
+
+	// Cluster Update functions, keep AddOrUpdatePrimaryCluster and AddOrUpdateClusterAndHost for compatible
+	UpdateCluster(cluster v2.Cluster, clusterHandler ClusterUpdateHandler) error
 
 	// Add Cluster health check callbacks
 	AddClusterHealthCheckCallbacks(name string, cb HealthCheckCb) error
@@ -54,11 +66,17 @@ type ClusterManager interface {
 	// AppendClusterHosts used to add cluster's hosts
 	AppendClusterHosts(clusterName string, hostConfigs []v2.Host) error
 
+	// Host Update functions, keep UpdateClusterHosts and AppendClusterHosts for compatible
+	UpdateHosts(clusterName string, hostConfigs []v2.Host, hostHandler HostUpdateHandler) error
+
 	// Get or Create tcp conn pool for a cluster
 	TCPConnForCluster(balancerContext LoadBalancerContext, snapshot ClusterSnapshot) CreateConnectionData
 
+	// Get or Create tcp conn pool for a cluster
+	UDPConnForCluster(balancerContext LoadBalancerContext, snapshot ClusterSnapshot) CreateConnectionData
+
 	// ConnPoolForCluster used to get protocol related conn pool
-	ConnPoolForCluster(balancerContext LoadBalancerContext, snapshot ClusterSnapshot, protocol api.Protocol) ConnectionPool
+	ConnPoolForCluster(balancerContext LoadBalancerContext, snapshot ClusterSnapshot, protocol api.ProtocolName) (ConnectionPool, Host)
 
 	// RemovePrimaryCluster used to remove cluster from set
 	RemovePrimaryCluster(clusters ...string) error
@@ -68,6 +86,15 @@ type ClusterManager interface {
 
 	// RemoveClusterHosts, remove the host by address string
 	RemoveClusterHosts(clusterName string, hosts []string) error
+
+	// TLSManager is used to cluster tls config
+	GetTLSManager() TLSClientContextManager
+	// UpdateTLSManager updates the tls manager which is used to cluster tls config
+	UpdateTLSManager(*v2.TLSConfig)
+
+	// ShutdownConnectionPool shutdown the connection pool by address and ProtocolName
+	// If ProtocolName is not specified, remove the addr's connection pool of all protocols
+	ShutdownConnectionPool(proto ProtocolName, addr string)
 
 	// Destroy the cluster manager
 	Destroy()
@@ -97,7 +124,7 @@ type Cluster interface {
 	Snapshot() ClusterSnapshot
 
 	// UpdateHosts updates the host set's hosts
-	UpdateHosts([]Host)
+	UpdateHosts(HostSet)
 
 	// Add health check callbacks in health checker
 	AddHealthCheckCallbacks(cb HealthCheckCb)
@@ -106,66 +133,60 @@ type Cluster interface {
 	StopHealthChecking()
 }
 
-// HostPredicate checks wether the host is matched the metadata
+// HostPredicate checks whether the host is matched the metadata
 type HostPredicate func(Host) bool
 
-// HostSet is as set of hosts that contains all of the endpoints for a given
+// HostSet is as set of hosts that contains all the endpoints for a given
 type HostSet interface {
-	// Hosts returns all hosts that make up the set at the current time.
-	Hosts() []Host
+	// Size return len(hosts) in hostSet
+	Size() int
 
-	// HealthyHosts returns all healthy hosts
-	HealthyHosts() []Host
+	// Get get hosts[i] in hostSet
+	// The value range of i should be [0, len(hosts) )
+	Get(i int) Host
+	// Range iterates each host in hostSet
+	Range(func(Host) bool)
 }
-
-// HealthFlag type
-type HealthFlag int
-
-const (
-	// The host is currently failing active health checks.
-	FAILED_ACTIVE_HC HealthFlag = 0x1
-	// The host is currently considered an outlier and has been ejected.
-	FAILED_OUTLIER_CHECK HealthFlag = 0x02
-)
 
 // Host is an upstream host
 type Host interface {
 	api.HostInfo
 
 	// HostStats returns the host stats metrics
-	HostStats() HostStats
+	HostStats() *HostStats
 
 	// ClusterInfo returns the cluster info
 	ClusterInfo() ClusterInfo
+	// SetClusterInfo updates the host's cluster info
+	SetClusterInfo(info ClusterInfo)
 
-	// Create a connection for this host.
+	// TLSHashValue TLS HashValue effects the host support tls state
+	TLSHashValue() *HashValue
+	// CreateConnection a connection for this host.
 	CreateConnection(context context.Context) CreateConnectionData
 
-	// ClearHealthFlag clear the input flag
-	ClearHealthFlag(flag HealthFlag)
-
-	// ContainHealthFlag checks whether the heatlhy state contains the flag
-	ContainHealthFlag(flag HealthFlag) bool
-
-	// SetHealthFlag set the input flag
-	SetHealthFlag(flag HealthFlag)
-
-	// HealthFlag returns the current healthy flag
-	HealthFlag() HealthFlag
-
-	// Health checks whether the host is healthy or not
-	Health() bool
+	// CreateUDPConnection an udp connection for this host.
+	CreateUDPConnection(context context.Context) CreateConnectionData
 
 	// Address returns the host's Addr structure
 	Address() net.Addr
 	// Config creates a host config by the host attributes
 	Config() v2.Host
+
+	// LastHealthCheckPassTime returns the timestamp when host has translated from unhealthy to healthy state
+	LastHealthCheckPassTime() time.Time
+	// SetLastHealthCheckPassTime updates the timestamp when host has translated from unhealthy to healthy state,
+	// or translated from other host
+	SetLastHealthCheckPassTime(lastHealthCheckPassTime time.Time)
 }
 
 // ClusterInfo defines a cluster's information
 type ClusterInfo interface {
 	// Name returns the cluster name
 	Name() string
+
+	// ClusterType returns the cluster type
+	ClusterType() v2.ClusterType
 
 	// LbType returns the cluster's load balancer type
 	LbType() LoadBalancerType
@@ -176,23 +197,43 @@ type ClusterInfo interface {
 	// MaxRequestsPerConn returns a connection's max request
 	MaxRequestsPerConn() uint32
 
+	Mark() uint32
+
 	// Stats returns the cluster's stats metrics
-	Stats() ClusterStats
+	Stats() *ClusterStats
 
 	// ResourceManager returns the ResourceManager
 	ResourceManager() ResourceManager
 
 	// TLSMng returns the tls manager
-	TLSMng() TLSContextManager
+	TLSMng() TLSClientContextManager
 
 	// LbSubsetInfo returns the load balancer subset's config
 	LbSubsetInfo() LBSubsetInfo
 
-	// ConectTimeout returns the connect timeout
+	// ConnectTimeout returns the connect timeout
 	ConnectTimeout() time.Duration
+
+	// IdleTimeout returns the idle timeout
+	IdleTimeout() time.Duration
+
+	// KeepAliveConfig returns the keepalive config
+	KeepAliveConfig() KeepAliveConfig
 
 	// LbOriDstInfo returns the load balancer oridst config
 	LbOriDstInfo() LBOriDstInfo
+
+	// Optional configuration for the load balancing algorithm selected by
+	LbConfig() *v2.LbConfig
+
+	//  Optional configuration for some cluster description
+	SubType() string
+
+	// SlowStart returns the slow start configurations
+	SlowStart() SlowStart
+
+	// IsClusterPoolEnable returns the cluster pool enable or not
+	IsClusterPoolEnable() bool
 }
 
 // ResourceManager manages different types of Resource
@@ -210,12 +251,14 @@ type ResourceManager interface {
 	Retries() Resource
 }
 
-// Resource is a interface to statistics information
+// Resource is an interface to statistics information
 type Resource interface {
 	CanCreate() bool
 	Increase()
 	Decrease()
 	Max() uint64
+	Cur() int64
+	UpdateCur(int64)
 }
 
 // HostStats defines a host's statistics information
@@ -237,9 +280,13 @@ type HostStats struct {
 	UpstreamRequestFailureEject                    metrics.Counter
 	UpstreamRequestPendingOverflow                 metrics.Counter
 	UpstreamRequestDuration                        metrics.Histogram
+	UpstreamRequestDurationEWMA                    metrics.EWMA
 	UpstreamRequestDurationTotal                   metrics.Counter
 	UpstreamResponseSuccess                        metrics.Counter
 	UpstreamResponseFailed                         metrics.Counter
+	UpstreamResponseTotalEWMA                      metrics.EWMA
+	UpstreamResponseClientErrorEWMA                metrics.EWMA
+	UpstreamResponseServerErrorEWMA                metrics.EWMA
 }
 
 // ClusterStats defines a cluster's statistics information
@@ -266,6 +313,7 @@ type ClusterStats struct {
 	UpstreamRequestFailureEject                    metrics.Counter
 	UpstreamRequestPendingOverflow                 metrics.Counter
 	UpstreamRequestDuration                        metrics.Histogram
+	UpstreamRequestDurationEWMA                    metrics.EWMA
 	UpstreamRequestDurationTotal                   metrics.Counter
 	UpstreamResponseSuccess                        metrics.Counter
 	UpstreamResponseFailed                         metrics.Counter
@@ -276,6 +324,13 @@ type ClusterStats struct {
 type CreateConnectionData struct {
 	Connection ClientConnection
 	Host       Host
+}
+
+type SlowStart struct {
+	Mode              SlowStartMode
+	SlowStartDuration time.Duration
+	Aggression        float64
+	MinWeightPercent  float64
 }
 
 // SimpleCluster is a simple cluster in memory
@@ -323,6 +378,8 @@ type LBOriDstInfo interface {
 
 	// GET header name
 	GetHeader() string
+
+	IsReplaceLocal() bool
 }
 
 // SortedHosts is an implementation of sort.Interface
@@ -391,15 +448,4 @@ func (ss *SortedStringSetType) Less(i, j int) bool {
 // Swap swaps the elements with indexes i and j.
 func (ss *SortedStringSetType) Swap(i, j int) {
 	ss.keys[i], ss.keys[j] = ss.keys[j], ss.keys[i]
-}
-
-func init() {
-	ConnPoolFactories = make(map[api.Protocol]bool)
-}
-
-var ConnPoolFactories map[api.Protocol]bool
-
-func RegisterConnPoolFactory(protocol api.Protocol, registered bool) {
-	//other
-	ConnPoolFactories[protocol] = registered
 }

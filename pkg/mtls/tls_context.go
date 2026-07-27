@@ -22,38 +22,78 @@ import (
 	"fmt"
 	"strings"
 
-	"mosn.io/mosn/pkg/config/v2"
+	v2 "mosn.io/mosn/pkg/config/v2"
 	"mosn.io/mosn/pkg/log"
 	"mosn.io/mosn/pkg/mtls/crypto/tls"
 	"mosn.io/mosn/pkg/types"
 )
 
-type secretInfo struct {
-	Certificate string
-	PrivateKey  string
-	Validation  string // root ca
+// TlsContextCallback will be called before 'newTlsContext' returns, which allows the retrieval of TlsContext
+type TlsContextCallback func(tlsContext TlsContext)
+
+var (
+	tlsContextCallback []TlsContextCallback
+)
+
+func RegisterTlsContextCallback(cb TlsContextCallback) {
+	if cb != nil {
+		tlsContextCallback = append(tlsContextCallback, cb)
+	}
 }
 
-// full returns whether the secret info is full enough for a tls config
-func (info *secretInfo) full() bool {
-	return info.Certificate != "" && info.PrivateKey != "" && info.Validation != ""
+type SecretInfo struct {
+	Certificate  string
+	PrivateKey   string
+	Validation   string // root ca
+	NoValidation bool
 }
 
-// tlsContext is an implmentation of basic provider
+// Full returns whether the secret info is full enough for a tls config
+func (info *SecretInfo) Full() bool {
+	return info.Certificate != "" && info.PrivateKey != "" && (info.Validation != "" || info.NoValidation)
+}
+
+type TlsContext interface {
+	// set the server side tls config
+	SetServerConfig(template *tls.Config, cfg *v2.TLSConfig, hooks ConfigHooks)
+	// return the server side TLSConfigContext
+	GetServerTLSConfigContext() *types.TLSConfigContext
+
+	// set the client side tls config
+	SetClientConfig(template *tls.Config, cfg *v2.TLSConfig, hooks ConfigHooks)
+	// return the client side TLSConfigContext
+	GetClientTLSConfigContext() *types.TLSConfigContext
+
+	// return the v2 tls config set by SetServerConfig/SetClientConfig
+	GetTLSConfig() *v2.TLSConfig
+	// return the tls SecretInfo set by SetServerConfig/SetClientConfig
+	GetSecretInfo() *SecretInfo
+
+	// whether the tls context matches the server name
+	MatchedServerName(sn string) bool
+	// whether the tls context matches the ALPN
+	MatchedALPN(protocols []string) bool
+}
+
+// tlsContext is an implementation of basic provider
 type tlsContext struct {
 	serverName string
 	ticket     string
 	matches    map[string]struct{}
-	client     *tls.Config
-	server     *tls.Config
+	config     *v2.TLSConfig
+	secret     *SecretInfo
+	client     *types.TLSConfigContext
+	server     *types.TLSConfigContext
 }
 
-func (ctx *tlsContext) buildMatch() {
-	if ctx.server == nil {
+var _ TlsContext = (*tlsContext)(nil)
+
+func (ctx *tlsContext) buildMatch(tlsConfig *tls.Config) {
+	if tlsConfig == nil {
 		return
 	}
 	matches := make(map[string]struct{})
-	certs := ctx.server.Certificates
+	certs := tlsConfig.Certificates
 	for i := range certs {
 		cert := certs[i]
 		x509Cert, err := x509.ParseCertificate(cert.Certificate[0])
@@ -67,36 +107,33 @@ func (ctx *tlsContext) buildMatch() {
 			matches[san] = struct{}{}
 		}
 	}
-	for _, protocol := range ctx.server.NextProtos {
+	for _, protocol := range tlsConfig.NextProtos {
 		matches[protocol] = struct{}{}
 	}
 	matches[ctx.serverName] = struct{}{}
 	ctx.matches = matches
 }
 
-func (ctx *tlsContext) setServerConfig(tmpl tls.Config, cfg *v2.TLSConfig, hooks ConfigHooks) {
-	tlsConfig := &tmpl
+func (ctx *tlsContext) SetServerConfig(tmpl *tls.Config, cfg *v2.TLSConfig, hooks ConfigHooks) {
+	tlsConfig := tmpl.Clone()
 	// no certificate should be set no server tls config
 	if len(tlsConfig.Certificates) == 0 {
 		return
 	}
-	if !cfg.RequireClientCert {
-		tlsConfig.ClientAuth = tls.NoClientCert
-	} else {
-		if cfg.VerifyClient {
-			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-		} else {
-			tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
-		}
-	}
+	tlsConfig.ClientAuth = hooks.GetClientAuth(cfg)
 	tlsConfig.VerifyPeerCertificate = hooks.ServerHandshakeVerify(tlsConfig)
-	ctx.server = tlsConfig
+
+	ctx.server = types.NewTLSConfigContext(tlsConfig, hooks.GenerateHashValue)
 	// build matches
-	ctx.buildMatch()
+	ctx.buildMatch(tlsConfig)
 }
 
-func (ctx *tlsContext) setClientConfig(tmpl tls.Config, cfg *v2.TLSConfig, hooks ConfigHooks) {
-	tlsConfig := &tmpl
+func (ctx *tlsContext) GetServerTLSConfigContext() *types.TLSConfigContext {
+	return ctx.server
+}
+
+func (ctx *tlsContext) SetClientConfig(tmpl *tls.Config, cfg *v2.TLSConfig, hooks ConfigHooks) {
+	tlsConfig := tmpl.Clone()
 	tlsConfig.ServerName = cfg.ServerName
 	tlsConfig.VerifyPeerCertificate = hooks.ClientHandshakeVerify(tlsConfig)
 	if tlsConfig.VerifyPeerCertificate != nil {
@@ -107,7 +144,19 @@ func (ctx *tlsContext) setClientConfig(tmpl tls.Config, cfg *v2.TLSConfig, hooks
 		tlsConfig.InsecureSkipVerify = true
 		tlsConfig.VerifyPeerCertificate = nil
 	}
-	ctx.client = tlsConfig
+	ctx.client = types.NewTLSConfigContext(tlsConfig, hooks.GenerateHashValue)
+}
+
+func (ctx *tlsContext) GetClientTLSConfigContext() *types.TLSConfigContext {
+	return ctx.client
+}
+
+func (ctx *tlsContext) GetTLSConfig() *v2.TLSConfig {
+	return ctx.config
+}
+
+func (ctx *tlsContext) GetSecretInfo() *SecretInfo {
+	return ctx.secret
 }
 
 func (ctx *tlsContext) MatchedServerName(sn string) bool {
@@ -130,8 +179,8 @@ func (ctx *tlsContext) MatchedServerName(sn string) bool {
 	return false
 }
 
-func (ctx *tlsContext) MatchedALPN(protos []string) bool {
-	for _, protocol := range protos {
+func (ctx *tlsContext) MatchedALPN(protocols []string) bool {
+	for _, protocol := range protocols {
 		protocol = strings.ToLower(protocol)
 		if _, ok := ctx.matches[protocol]; ok {
 			return true
@@ -140,18 +189,18 @@ func (ctx *tlsContext) MatchedALPN(protos []string) bool {
 	return false
 }
 
-func (ctx *tlsContext) GetTLSConfig(client bool) *tls.Config {
+func (ctx *tlsContext) GetTLSConfigContext(client bool) *types.TLSConfigContext {
 	if client {
-		return ctx.client.Clone()
+		return ctx.client
 	} else {
 		if ctx.server == nil {
 			return nil
 		}
-		return ctx.server.Clone()
+		return ctx.server
 	}
 }
 
-func newTLSContext(cfg *v2.TLSConfig, secret *secretInfo) (*tlsContext, error) {
+func newTLSContext(cfg *v2.TLSConfig, secret *SecretInfo) (*tlsContext, error) {
 	// basic template
 	tmpl, err := tlsConfigTemplate(cfg)
 	if err != nil {
@@ -187,11 +236,19 @@ func newTLSContext(cfg *v2.TLSConfig, secret *secretInfo) (*tlsContext, error) {
 		}
 	}
 
+	ctx.config = cfg
+	ctx.secret = secret
+
 	// needs copy template config
 	if len(tmpl.Certificates) > 0 {
-		ctx.setServerConfig(*tmpl, cfg, hooks)
+		ctx.SetServerConfig(tmpl, cfg, hooks)
 	}
-	ctx.setClientConfig(*tmpl, cfg, hooks)
+	ctx.SetClientConfig(tmpl, cfg, hooks)
+
+	for _, cb := range tlsContextCallback {
+		cb(ctx)
+	}
+
 	return ctx, nil
 
 }
@@ -253,7 +310,8 @@ func tlsConfigTemplate(c *v2.TLSConfig) (*tls.Config, error) {
 		for _, p := range protocols {
 			_, ok := alpn[strings.ToLower(p)]
 			if !ok {
-				return nil, fmt.Errorf("ALPN %s is not supported", p)
+				log.DefaultLogger.Debugf("[mtls] ALPN %s is not supported", p)
+				continue
 			}
 			tlsConfig.NextProtos = append(tlsConfig.NextProtos, p)
 		}

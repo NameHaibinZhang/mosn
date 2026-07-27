@@ -19,12 +19,17 @@ package cluster
 
 import (
 	"fmt"
+	"math/rand"
 	"reflect"
 	"sort"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"mosn.io/api"
-	"mosn.io/mosn/pkg/config/v2"
+	v2 "mosn.io/mosn/pkg/config/v2"
 	"mosn.io/mosn/pkg/types"
 )
 
@@ -87,6 +92,7 @@ func exampleHostConfigs() (hosts []v2.Host) {
 			HostConfig: v2.HostConfig{
 				Hostname: hostName,
 				Address:  addr,
+				Weight:   uint32(i) + 1,
 			},
 			MetaData: md,
 		}
@@ -96,6 +102,9 @@ func exampleHostConfigs() (hosts []v2.Host) {
 }
 
 func createHostset(cfg []v2.Host) *hostSet {
+	// clear healthy flag
+	healthStore = sync.Map{}
+	// create
 	var hosts []types.Host
 	for _, h := range cfg {
 		host := &mockHost{
@@ -103,6 +112,22 @@ func createHostset(cfg []v2.Host) *hostSet {
 			addr: h.Address,
 			meta: h.MetaData,
 		}
+		hosts = append(hosts, host)
+	}
+	hs := &hostSet{}
+	hs.setFinalHost(hosts)
+	return hs
+}
+func createHostsetWithStats(cfg []v2.Host, clusterName string) *hostSet {
+	var hosts []types.Host
+	for _, h := range cfg {
+		host := &mockHost{
+			name: h.Hostname,
+			addr: h.Address,
+			meta: h.MetaData,
+			w:    h.Weight,
+		}
+		host.stats = newHostStats(clusterName, host.addr)
 		hosts = append(hosts, host)
 	}
 	hs := &hostSet{}
@@ -210,18 +235,34 @@ func (r *subSetMapResult) RangeSubsetMap(prefix string, subsetMap types.LbSubset
 			}
 			if entry.Initialized() {
 				e := entry.(*LBSubsetEntryImpl)
-				hosts := e.hostSet.Hosts()
 				hostsNode := []string{}
-				for _, h := range hosts {
-					hostsNode = append(hostsNode, h.Hostname())
-				}
+				e.hostSet.Range(func(host types.Host) bool {
+					hostsNode = append(hostsNode, host.Hostname())
+					return true
+				})
 				r.result[p] = hostsNode
 			}
 		}
 	}
 }
+func newSubsetLoadBalancers(lbType types.LoadBalancerType, hosts *hostSet, stats *types.ClusterStats, subsets types.LBSubsetInfo) map[string]*subsetLoadBalancer {
+	return map[string]*subsetLoadBalancer{
+		"default":  newSubsetLoadBalancer(lbType, hosts, stats, subsets),
+		"preIndex": newSubsetLoadBalancerPreIndex(lbType, hosts, stats, subsets),
+	}
+}
 
-func newSubsetLoadBalancer(lbType types.LoadBalancerType, hosts *hostSet, stats types.ClusterStats, subsets types.LBSubsetInfo) *subsetLoadBalancer {
+func newSubsetLoadBalancerPreIndex(lbType types.LoadBalancerType, hosts *hostSet, stats *types.ClusterStats, subsets types.LBSubsetInfo) *subsetLoadBalancer {
+	info := &clusterInfo{
+		lbType:       lbType,
+		stats:        stats,
+		lbSubsetInfo: subsets,
+	}
+	lb := NewSubsetLoadBalancerPreIndex(info, hosts)
+	return lb.(*subsetLoadBalancer)
+}
+
+func newSubsetLoadBalancer(lbType types.LoadBalancerType, hosts *hostSet, stats *types.ClusterStats, subsets types.LBSubsetInfo) *subsetLoadBalancer {
 	info := &clusterInfo{
 		lbType:       lbType,
 		stats:        stats,
@@ -234,14 +275,17 @@ func newSubsetLoadBalancer(lbType types.LoadBalancerType, hosts *hostSet, stats 
 // create a subset as expected, see example
 func TestNewSubsetLoadBalancer(t *testing.T) {
 	ps := createHostset(exampleHostConfigs())
-	lb := newSubsetLoadBalancer(types.RoundRobin, ps, newClusterStats("TestNewSubsetLoadBalancer"), NewLBSubsetInfo(exampleSubsetConfig()))
-	subSet := lb.subSets
-	result := &subSetMapResult{
-		result: map[string][]string{},
-	}
-	result.RangeSubsetMap("", subSet)
-	if !resultMapEqual(result.result, exampleResult) {
-		t.Errorf("subset tree created is not expected, %v", result.result)
+	lbs := newSubsetLoadBalancers(types.RoundRobin, ps, newClusterStats("TestNewSubsetLoadBalancer"), NewLBSubsetInfo(exampleSubsetConfig()))
+	for name, lb := range lbs {
+
+		subSet := lb.subSets
+		result := &subSetMapResult{
+			result: map[string][]string{},
+		}
+		result.RangeSubsetMap("", subSet)
+		if !resultMapEqual(result.result, exampleResult) {
+			t.Errorf("[%s] subset tree created is not expected, %v", name, result.result)
+		}
 	}
 }
 
@@ -250,7 +294,7 @@ func TestNewSubsetLoadBalancer(t *testing.T) {
 // case2: stage:prod: should find nil
 func TestNewSubsetChooseHost(t *testing.T) {
 	ps := createHostset(exampleHostConfigs())
-	lb := newSubsetLoadBalancer(types.RoundRobin, ps, newClusterStats("TestNewSubsetChooseHost"), NewLBSubsetInfo(exampleSubsetConfig()))
+	lbs := newSubsetLoadBalancers(types.RoundRobin, ps, newClusterStats("TestNewSubsetChooseHost"), NewLBSubsetInfo(exampleSubsetConfig()))
 	ctx1 := newMockLbContext(map[string]string{
 		"stage":   "prod",
 		"version": "1.0",
@@ -258,17 +302,20 @@ func TestNewSubsetChooseHost(t *testing.T) {
 	ctx2 := newMockLbContext(map[string]string{
 		"stage": "prod",
 	})
-	h, ok := lb.tryChooseHostFromContext(ctx1)
-	if !ok || h == nil {
-		t.Fatal("choose host failed, expected success")
-	}
-	switch h.Hostname() {
-	case "e1", "e2", "e5":
-	default:
-		t.Fatal("host found, but not the expected subset", h.Hostname())
-	}
-	if h, ok := lb.tryChooseHostFromContext(ctx2); ok || h != nil {
-		t.Fatalf("expected choose failed, but returns a host, host: %v, ok: %v", h, ok)
+	for name, lb := range lbs {
+
+		h, ok := lb.tryChooseHostFromContext(ctx1)
+		if !ok || h == nil {
+			t.Fatalf("[%s] choose host failed, expected success", name)
+		}
+		switch h.Hostname() {
+		case "e1", "e2", "e5":
+		default:
+			t.Fatalf("[%s] host found, but not the expected subset %s", name, h.Hostname())
+		}
+		if h, ok := lb.tryChooseHostFromContext(ctx2); ok || h != nil {
+			t.Fatalf("[%s] expected choose failed, but returns a host, host: %v, ok: %v", name, h, ok)
+		}
 	}
 }
 
@@ -284,7 +331,7 @@ func TestNoSubsetHost(t *testing.T) {
 	}
 	// only one host will put in subset (e1)
 	// others cannot be found in subset even if version is matched
-	lb := newSubsetLoadBalancer(types.RoundRobin, ps, newClusterStats("TestNoSubsetHost"), NewLBSubsetInfo(cfg))
+	lbs := newSubsetLoadBalancers(types.RoundRobin, ps, newClusterStats("TestNoSubsetHost"), NewLBSubsetInfo(cfg))
 	// found no host
 	ctx1 := newMockLbContext(map[string]string{
 		"version": "1.0",
@@ -294,23 +341,26 @@ func TestNoSubsetHost(t *testing.T) {
 		"version": "1.0",
 		"xlarge":  "true",
 	})
-	// test HostNum
-	if lb.HostNum(ctx1.MetadataMatchCriteria()) != 0 {
-		t.Fatalf("expected hosts is 0")
-	}
-	if lb.HostNum(ctx2.MetadataMatchCriteria()) != 1 {
-		t.Fatalf("expected hosts is 1")
-	}
-	if h, ok := lb.tryChooseHostFromContext(ctx1); ok || h != nil {
-		t.Fatalf("expected choose failed, but returns a host, host: %v, ok: %v", h, ok)
-	}
-	for i := 0; i < 10; i++ {
-		h, ok := lb.tryChooseHostFromContext(ctx2)
-		if !ok || h == nil {
-			t.Fatal("choose host failed, expected success")
+	for name, lb := range lbs {
+
+		// test HostNum
+		if lb.HostNum(ctx1.MetadataMatchCriteria()) != 0 {
+			t.Fatalf("[%s] expected hosts is 0", name)
 		}
-		if h.Hostname() != "e1" {
-			t.Fatalf("host found not expected, got: %s", h.Hostname())
+		if lb.HostNum(ctx2.MetadataMatchCriteria()) != 1 {
+			t.Fatalf("[%s] expected hosts is 1", name)
+		}
+		if h, ok := lb.tryChooseHostFromContext(ctx1); ok || h != nil {
+			t.Fatalf("[%s] expected choose failed, but returns a host, host: %v, ok: %v", name, h, ok)
+		}
+		for i := 0; i < 10; i++ {
+			h, ok := lb.tryChooseHostFromContext(ctx2)
+			if !ok || h == nil {
+				t.Fatalf("[%s] choose host failed, expected success", name)
+			}
+			if h.Hostname() != "e1" {
+				t.Fatalf("[%s] host found not expected, got: %s", name, h.Hostname())
+			}
 		}
 	}
 }
@@ -337,7 +387,7 @@ func TestFallbackWithDefaultSubset(t *testing.T) {
 	// ctx3: version:1.2, xlarge: true. not matched, find is fallabck, e7
 	// ctx4: stage: prod. not matched, find is fallback, e7
 	// ctx5~7: nil(mmc is nil/no value). not matched, find is fallback e7
-	lb := newSubsetLoadBalancer(types.RoundRobin, ps, newClusterStats("TestFallbackWithDefaultSubset"), NewLBSubsetInfo(cfg))
+	lbs := newSubsetLoadBalancers(types.RoundRobin, ps, newClusterStats("TestFallbackWithDefaultSubset"), NewLBSubsetInfo(cfg))
 	testCases := []struct {
 		ctx          types.LoadBalancerContext
 		expectedHost string
@@ -374,22 +424,20 @@ func TestFallbackWithDefaultSubset(t *testing.T) {
 			expectedHost: "e7",
 		},
 		{
-			ctx:          newMockLbContext(nil),
-			expectedHost: "e7",
-		},
-		{
 			ctx:          newMockLbContext(map[string]string{}),
 			expectedHost: "e7",
 		},
 	}
-	for i, tc := range testCases {
-		h := lb.ChooseHost(tc.ctx)
-		if h == nil {
-			t.Errorf("#%d choose host failed", i)
-			continue
-		}
-		if h.Hostname() != tc.expectedHost {
-			t.Errorf("#%d choose host is not expected, expected %s, got %s", i, tc.expectedHost, h.Hostname())
+	for name, lb := range lbs {
+		for i, tc := range testCases {
+			h := lb.ChooseHost(tc.ctx)
+			if h == nil {
+				t.Errorf("#%d [%s] choose host failed", i, name)
+				continue
+			}
+			if h.Hostname() != tc.expectedHost {
+				t.Errorf("#%d [%s] choose host is not expected, expected %s, got %s", i, name, tc.expectedHost, h.Hostname())
+			}
 		}
 	}
 }
@@ -445,15 +493,17 @@ func TestFallbackWithAllHosts(t *testing.T) {
 		"room->room0->zone->zone0->": []string{"host1"},
 	}
 	// New
-	lb := newSubsetLoadBalancer(types.RoundRobin, ps, newClusterStats("TestFallbackWithAllHosts"), NewLBSubsetInfo(cfg))
-	subSet := lb.subSets
-	result := &subSetMapResult{
-		result: map[string][]string{},
-	}
-	// Verify subset created
-	result.RangeSubsetMap("", subSet)
-	if !resultMapEqual(result.result, expectedResult) {
-		t.Errorf("subset tree created is not expected, got: %v, expected: %v", result.result, expectedResult)
+	lbs := newSubsetLoadBalancers(types.RoundRobin, ps, newClusterStats("TestFallbackWithAllHosts"), NewLBSubsetInfo(cfg))
+	for name, lb := range lbs {
+		subSet := lb.subSets
+		result := &subSetMapResult{
+			result: map[string][]string{},
+		}
+		// Verify subset created
+		result.RangeSubsetMap("", subSet)
+		if !resultMapEqual(result.result, expectedResult) {
+			t.Errorf("[%s] subset tree created is not expected, got: %v, expected: %v", name, result.result, expectedResult)
+		}
 	}
 	// choose host test
 	testCases := []struct {
@@ -531,16 +581,18 @@ func TestFallbackWithAllHosts(t *testing.T) {
 		},
 	}
 RUNCASE:
-	for i, tc := range testCases {
-		for j := 0; j < 3; j++ { // choose multi times
-			h := lb.ChooseHost(tc.ctx)
-			if h == nil {
-				t.Errorf("#%d choose host failed", i)
-				continue RUNCASE
-			}
-			if !strInSlice(h.Hostname(), tc.expectedHosts) {
-				t.Errorf("#%d choose host not expected, expected: %v, got: %s", i, tc.expectedHosts, h.Hostname())
-				continue RUNCASE
+	for name, lb := range lbs {
+		for i, tc := range testCases {
+			for j := 0; j < 3; j++ { // choose multi times
+				h := lb.ChooseHost(tc.ctx)
+				if h == nil {
+					t.Errorf("#%d [%s] choose host failed", i, name)
+					continue RUNCASE
+				}
+				if !strInSlice(h.Hostname(), tc.expectedHosts) {
+					t.Errorf("#%d [%s] choose host not expected, expected: %v, got: %s", i, name, tc.expectedHosts, h.Hostname())
+					continue RUNCASE
+				}
 			}
 		}
 	}
@@ -578,10 +630,10 @@ func TestDynamicSubsetHost(t *testing.T) {
 			},
 		},
 	}
-	cluster := newSimpleCluster(clusterConfig)
+	cluster := newSimpleCluster(clusterConfig).(*simpleCluster)
 	// create a subset
 	{
-		cluster.UpdateHosts([]types.Host{hostA})
+		cluster.UpdateHosts(NewHostSet([]types.Host{hostA}))
 		expectedResult := map[string][]string{
 			"group->a->zone->zone0->": []string{"A"},
 			"zone->zone0->":           []string{"A"},
@@ -606,7 +658,7 @@ func TestDynamicSubsetHost(t *testing.T) {
 	}
 	// remove a host
 	{
-		cluster.UpdateHosts([]types.Host{})
+		cluster.UpdateHosts(NewHostSet([]types.Host{}))
 		result := &subSetMapResult{
 			result: map[string][]string{},
 		}
@@ -635,7 +687,7 @@ func TestDynamicSubsetHost(t *testing.T) {
 				"group": "b",
 			},
 		}
-		cluster.UpdateHosts([]types.Host{hostB})
+		cluster.UpdateHosts(NewHostSet([]types.Host{hostB}))
 		expectedResult := map[string][]string{
 			"zone->zone0->":           []string{"B"},
 			"group->b->zone->zone0->": []string{"B"},
@@ -680,7 +732,7 @@ func TestDynamicSubsetHost(t *testing.T) {
 				"group": "a",
 			},
 		}
-		cluster.UpdateHosts([]types.Host{hostB})
+		cluster.UpdateHosts(NewHostSet([]types.Host{hostB}))
 		expectedResult := map[string][]string{
 			"zone->zone0->":           []string{"B"},
 			"group->a->zone->zone0->": []string{"B"},
@@ -695,4 +747,188 @@ func TestDynamicSubsetHost(t *testing.T) {
 		}
 	}
 
+}
+
+func TestFallbackAny(t *testing.T) {
+	// use cluster manager to register dynamic host changed
+	clusterName := "TestSubset"
+	hostA := &mockHost{
+		addr: "127.0.0.1:8080",
+		name: "A",
+		meta: api.Metadata{
+			"zone":  "zone0",
+			"group": "a",
+		},
+	}
+	hostB := &mockHost{
+		addr: "127.0.0.1:8081",
+		name: "B",
+		meta: api.Metadata{
+			"zone":  "zone0",
+			"group": "b",
+		},
+	}
+	clusterConfig := v2.Cluster{
+		Name:                 clusterName,
+		ClusterType:          v2.SIMPLE_CLUSTER,
+		LbType:               v2.LB_RANDOM,
+		MaxRequestPerConn:    1024,
+		ConnBufferLimitBytes: 1024,
+		LBSubSetConfig: v2.LBSubsetConfig{
+			FallBackPolicy: uint8(types.AnyEndPoint),
+			SubsetSelectors: [][]string{
+				[]string{"group"},
+				[]string{"zone"},
+			},
+		},
+	}
+	cluster := newSimpleCluster(clusterConfig).(*simpleCluster)
+	cluster.UpdateHosts(NewHostSet([]types.Host{hostA, hostB}))
+	lb := cluster.lbInstance.(*subsetLoadBalancer)
+	ctx := newMockLbContext(map[string]string{
+		"zone":  "zone0",
+		"group": "a",
+	})
+
+	// should run into fallback policy: AnyEndPoint, and return all 2 hosts
+	assert.Equal(t, 2, lb.HostNum(ctx.MetadataMatchCriteria()))
+	assert.True(t, lb.IsExistsHosts(ctx.MetadataMatchCriteria()))
+}
+
+func TestNoFallbackWithEmpty(t *testing.T) {
+	// allback policy is no fallback
+	// but empty meta data can be used as any point fallback
+	ps := createHostset(exampleHostConfigs())
+	cfg := exampleSubsetConfig()
+	cfg.FallBackPolicy = uint8(types.NoFallBack) // NoFallBack
+	lbs := newSubsetLoadBalancers(types.RoundRobin, ps, newClusterStats("TestNewSubsetChooseHost"), NewLBSubsetInfo(cfg))
+
+	cases := []struct {
+		ctx   types.LoadBalancerContext
+		hosts int
+	}{
+		{
+			ctx:   newMockLbContext(map[string]string{"stage": "prod", "version": "1.0"}),
+			hosts: 3,
+		},
+		{
+			ctx:   newMockLbContext(map[string]string{"stage": "prod"}),
+			hosts: 0,
+		},
+		{
+			ctx:   newMockLbContext(nil),
+			hosts: 7, // all hosts
+		},
+	}
+	for name, lb := range lbs {
+
+		for _, c := range cases {
+			hnum := lb.HostNum(c.ctx.MetadataMatchCriteria())
+			require.Equal(t, c.hosts, hnum, "[%s]", name)
+			for i := 0; i < 7; i++ {
+				h := lb.ChooseHost(c.ctx)
+				if c.hosts > 0 {
+					require.True(t, lb.IsExistsHosts(c.ctx.MetadataMatchCriteria()), "[%s]", name)
+					require.NotNil(t, h, "[%s]", name)
+				} else {
+					require.False(t, lb.IsExistsHosts(c.ctx.MetadataMatchCriteria()), "[%s]", name)
+					require.Nil(t, h, "[%s]", name)
+				}
+			}
+		}
+	}
+
+}
+
+func TestSubsetLoadBalancers(t *testing.T) {
+	info := NewLBSubsetInfo(exampleSubsetConfig()).(*LBSubsetInfoImpl)
+	stats := newClusterStats("TestNewSubsetLoadBalancer")
+	ps := createHostset(exampleHostConfigs())
+	t.Run("test no fallback", func(t *testing.T) {
+		lbs := newSubsetLoadBalancers(types.RoundRobin, ps, stats, info)
+		for _, slb := range lbs {
+			require.Equal(t, len(exampleResult)+1, len(slb.LoadBalancers()))
+		}
+	})
+	t.Run("test with default fallback", func(t *testing.T) {
+		info.fallbackPolicy = types.DefaultSubset
+		info.defaultSubSet = types.SubsetMetadata(
+			[]types.Pair{
+				{
+					T1: "version",
+					T2: "1.0",
+				},
+			},
+		)
+		lbs := newSubsetLoadBalancers(types.RoundRobin, ps, stats, info)
+		for _, slb := range lbs {
+			require.Equal(t, len(exampleResult)+2, len(slb.LoadBalancers()))
+		}
+	})
+	t.Run("test with any fallback", func(t *testing.T) {
+		info.fallbackPolicy = types.AnyEndPoint
+		lbs := newSubsetLoadBalancers(types.RoundRobin, ps, stats, info)
+		for _, slb := range lbs {
+			require.Equal(t, len(exampleResult)+2, len(slb.LoadBalancers()))
+		}
+	})
+}
+
+func benchHostConfigs(hostCount int, zones int) []v2.Host {
+	ret := make([]v2.Host, 0, hostCount)
+	rand.Seed(time.Now().UnixNano())
+	keys := []string{"physics", "mosn_aig", "mosn_version"}
+	for i := 0; i < hostCount; i++ {
+		metadata := make(map[string]string)
+		r := rand.Intn(zones)
+		metadata["zone"] = fmt.Sprintf("zone-%d", r)
+		for _, key := range keys {
+			metadata[key] = key
+		}
+		host := v2.Host{
+			HostConfig: v2.HostConfig{
+				Hostname: fmt.Sprintf("e%d", i),
+				Address:  fmt.Sprintf("127.0.0.1:%d", i),
+			},
+			MetaData: metadata,
+		}
+		ret = append(ret, host)
+	}
+	return ret
+}
+
+func benchSubsetConfig() *v2.LBSubsetConfig {
+	return &v2.LBSubsetConfig{
+		SubsetSelectors: [][]string{
+			{"zone", "physics"},
+			{"zone"},
+			{"physics"},
+			{"zone", "physics", "mosn_aig"},
+			{"zone", "physics", "mosn_version"},
+			{"zone", "physics", "mosn_aig", "mosn_version"},
+			{"zone", "mosn_aig"},
+			{"zone", "mosn_version"},
+			{"zone", "mosn_aig", "mosn_version"},
+			{"physics", "mosn_aig"},
+			{"physics", "mosn_version"},
+			{"physics", "mosn_aig", "mosn_version"},
+			{"mosn_aig"},
+			{"mosn_version"},
+			{"mosn_aig", "mosn_version"},
+		}}
+}
+
+func BenchmarkSubsetLoadBalancer(b *testing.B) {
+	ps := createHostset(benchHostConfigs(8000, 3))
+	subsetConfig := benchSubsetConfig()
+	b.Run("subsetLoadBalancer", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			newSubsetLoadBalancer(types.RoundRobin, ps, newClusterStats("BenchmarkSubsetLoadBalancer"), NewLBSubsetInfo(subsetConfig))
+		}
+	})
+	b.Run("subsetLoadBalancerPreIndex", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			newSubsetLoadBalancerPreIndex(types.RoundRobin, ps, newClusterStats("BenchmarkSubsetLoadBalancer"), NewLBSubsetInfo(subsetConfig))
+		}
+	})
 }

@@ -21,32 +21,39 @@ import (
 	"encoding/json"
 
 	"github.com/c2h5oh/datasize"
-	xdsboot "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v2"
-	"github.com/gogo/protobuf/jsonpb"
+
+	"mosn.io/api"
 )
 
 // MOSNConfig make up mosn to start the mosn project
 // Servers contains the listener, filter and so on
 // ClusterManager used to manage the upstream
 type MOSNConfig struct {
-	Servers         []ServerConfig       `json:"servers,omitempty"`          //server config
-	ClusterManager  ClusterManagerConfig `json:"cluster_manager,omitempty"`  //cluster config
-	ServiceRegistry ServiceRegistryInfo  `json:"service_registry,omitempty"` //service registry config, used by service discovery module
-	//tracing config
-	Tracing             TracingConfig   `json:"tracing,omitempty"`
-	Metrics             MetricsConfig   `json:"metrics,omitempty"`
-	RawDynamicResources json.RawMessage `json:"dynamic_resources,omitempty"` //dynamic_resources raw message
-	RawStaticResources  json.RawMessage `json:"static_resources,omitempty"`  //static_resources raw message
-	RawAdmin            json.RawMessage `json:"admin,omitempty"`             // admin raw message
-	Debug               PProfConfig     `json:"pprof,omitempty"`
-	Pid                 string          `json:"pid,omitempty"`    // pid file
-	Plugin              PluginConfig    `json:"plugin,omitempty"` // plugin config
+	Servers              []ServerConfig       `json:"servers,omitempty"`                //server config
+	ClusterManager       ClusterManagerConfig `json:"cluster_manager,omitempty"`        //cluster config
+	DisableUpgrade       bool                 `json:"disable_upgrade,omitempty"`        // not upgrade from old mosn, default false
+	CloseGraceful        bool                 `json:"close_graceful,omitempty"`         // deprecated, same as disable_upgrade
+	InheritOldMosnconfig bool                 `json:"inherit_old_mosnconfig,omitempty"` // inherit old mosn config switch, default false
+	Tracing              TracingConfig        `json:"tracing,omitempty"`
+	Metrics              MetricsConfig        `json:"metrics,omitempty"`
+	RawDynamicResources  json.RawMessage      `json:"dynamic_resources,omitempty"` //dynamic_resources raw message
+	RawStaticResources   json.RawMessage      `json:"static_resources,omitempty"`  //static_resources raw message
+	Node                 json.RawMessage      `json:"node,omitempty"`              // node info for pilot
+	RawAdmin             *Admin               `json:"admin,omitempty"`             // admin
+	Debug                PProfConfig          `json:"pprof,omitempty"`
+	Pid                  string               `json:"pid,omitempty"`                 // pid file
+	UDSDir               string               `json:"uds_dir,omitempty"`             // unix domain socket directory
+	Plugin               PluginConfig         `json:"plugin,omitempty"`              // plugin config
+	ThirdPartCodec       ThirdPartCodecConfig `json:"third_part_codec,omitempty"`    // third part codec config
+	Extends              []ExtendConfig       `json:"extends,omitempty"`             // extend config
+	Wasms                []WasmPluginConfig   `json:"wasm_global_plugins,omitempty"` // wasm config
 }
 
 // PProfConfig is used to start a pprof server for debug
 type PProfConfig struct {
-	StartDebug bool `json:"debug"`      // If StartDebug is true, start a pprof, default is false
-	Port       int  `json:"port_value"` // If port value is 0, will use 9090 as default
+	StartDebug bool   `json:"debug"`      // If StartDebug is true, start a pprof, default is false
+	Port       int    `json:"port_value"` // If port value is 0, will use 9090 as default
+	Endpoint   string `json:"endpoint"`   // If endpoint is empty, will use "0.0.0.0" as default
 }
 
 // Tracing configuration for a server
@@ -63,11 +70,58 @@ type MetricsConfig struct {
 	StatsMatcher StatsMatcher      `json:"stats_matcher"`
 	ShmZone      string            `json:"shm_zone"`
 	ShmSize      datasize.ByteSize `json:"shm_size"`
+	FlushMosn    bool              `json:"flush_mosn"`
+	LazyFlush    bool              `json:"lazy_flush"`
+	SampleConfig SampleConfig      `json:"sample"`
+	EWMAConfig   *EWMAConfig       `json:"ewma,omitempty"`
+}
+
+// SampleConfig for metrics histogram
+type SampleConfig struct {
+	Type          string  `json:"type"`
+	Size          int     `json:"size"`
+	ExpDecayAlpha float64 `json:"exp_decay_alpha"`
+}
+
+// EWMAConfig for configuring EWMA alpha
+type EWMAConfig struct {
+	Alpha    float64             `json:"alpha"`
+	Target   float64             `json:"target"`
+	Duration *api.DurationConfig `json:"duration"`
 }
 
 // PluginConfig for plugin config
 type PluginConfig struct {
 	LogBase string `json:"log_base"`
+}
+
+// ThirdPartCodecType represents type of a third part codec
+type ThirdPartCodecType string
+
+// Third part codec consts
+const (
+	GoPlugin ThirdPartCodecType = "go-plugin"
+	Wasm     ThirdPartCodecType = "wasm"
+)
+
+// ThirdPartCodec represents configuration for a third part codec
+type ThirdPartCodec struct {
+	Enable         bool                   `json:"enable,omitempty"`
+	Type           ThirdPartCodecType     `json:"type,omitempty"`
+	Path           string                 `json:"path,omitempty"`
+	LoaderFuncName string                 `json:"loader_func_name,omitempty"`
+	Config         map[string]interface{} `json:"config,omitempty"`
+}
+
+// ThirdPartCodecConfig represents configurations for third part codec
+type ThirdPartCodecConfig struct {
+	Codecs []ThirdPartCodec `json:"codecs"`
+}
+
+// ExtendConfig for any extends
+type ExtendConfig struct {
+	Type   string          `json:"type"`
+	Config json.RawMessage `json:"config"`
 }
 
 // StatsMatcher is a configuration for disabling stat instantiation.
@@ -98,20 +152,41 @@ func (c *MOSNConfig) Mode() Mode {
 		}
 
 		return Mix
-	} else if len(c.RawStaticResources) > 0 && len(c.RawDynamicResources) > 0 {
+	}
+	if len(c.RawStaticResources) > 0 && len(c.RawDynamicResources) > 0 {
 		return Xds
 	}
 
 	return File
 }
 
-func (c *MOSNConfig) GetAdmin() *xdsboot.Admin {
-	if len(c.RawAdmin) > 0 {
-		adminConfig := &xdsboot.Admin{}
-		err := jsonpb.UnmarshalString(string(c.RawAdmin), adminConfig)
-		if err == nil {
-			return adminConfig
-		}
+type Admin struct {
+	Address *AddressInfo `json:"address,omitempty"`
+}
+
+func (admin *Admin) GetAddress() string {
+	if admin.Address == nil {
+		return ""
 	}
-	return nil
+	return admin.Address.SocketAddress.Address
+}
+
+func (admin *Admin) GetPortValue() uint32 {
+	if admin.Address == nil {
+		return 0
+	}
+	return admin.Address.SocketAddress.PortValue
+}
+
+type AddressInfo struct {
+	SocketAddress SocketAddress `json:"socket_address,omitempty"`
+}
+
+type SocketAddress struct {
+	Address   string `json:"address,omitempty"`
+	PortValue uint32 `json:"port_value,omitempty"`
+}
+
+func (c *MOSNConfig) GetAdmin() *Admin {
+	return c.RawAdmin
 }

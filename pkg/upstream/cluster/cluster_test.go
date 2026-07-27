@@ -1,7 +1,27 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package cluster
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"mosn.io/api"
 	v2 "mosn.io/mosn/pkg/config/v2"
@@ -15,12 +35,24 @@ func _createTestCluster() types.Cluster {
 		LBSubSetConfig: v2.LBSubsetConfig{
 			FallBackPolicy: 1, // AnyEndPoint
 			SubsetSelectors: [][]string{
-				[]string{"version"},
-				[]string{"version", "zone"},
+				{"version"},
+				{"version", "zone"},
 			},
 		},
 	}
 	return NewCluster(clusterConfig)
+}
+
+func TestNewClusterInfoWithDefaultSlowStartConfig(t *testing.T) {
+	clusterConfig := v2.Cluster{
+		Name:      "test_cluster",
+		LbType:    v2.LB_ROUNDROBIN,
+		SlowStart: v2.SlowStartConfig{},
+	}
+	clusterInfo := NewClusterInfo(clusterConfig)
+	assert.Zero(t, clusterInfo.SlowStart().SlowStartDuration)
+	assert.Equal(t, 1.0, clusterInfo.SlowStart().Aggression)        // 1.0 by default
+	assert.Equal(t, 0.10, clusterInfo.SlowStart().MinWeightPercent) // 10% by default
 }
 
 func TestClusterUpdateHosts(t *testing.T) {
@@ -29,19 +61,19 @@ func TestClusterUpdateHosts(t *testing.T) {
 	pool := makePool(100)
 	var hosts []types.Host
 	metas := []api.Metadata{
-		api.Metadata{"version": "1", "zone": "a"},
-		api.Metadata{"version": "1", "zone": "b"},
-		api.Metadata{"version": "2", "zone": "a"},
+		{"version": "1", "zone": "a"},
+		{"version": "1", "zone": "b"},
+		{"version": "2", "zone": "a"},
 		nil, // no meta (in any point)
 	}
 	for _, meta := range metas {
 		hosts = append(hosts, pool.MakeHosts(10, meta)...)
 	}
-	cluster.UpdateHosts(hosts)
+	cluster.UpdateHosts(NewHostSet(hosts))
 	// verify
 	snap := cluster.Snapshot()
 	subLb := snap.LoadBalancer().(*subsetLoadBalancer)
-	if len(subLb.fallbackSubset.hostSet.Hosts()) != 40 {
+	if subLb.fallbackSubset.HostNum() != 40 {
 		t.Fatal("default fallback should be all hosts")
 	}
 	result := &subSetMapResult{
@@ -77,11 +109,11 @@ func TestClusterUpdateHosts(t *testing.T) {
 		"version": "3",
 		"ignore":  "true",
 	})...)
-	cluster.UpdateHosts(newHosts)
+	cluster.UpdateHosts(NewHostSet(newHosts))
 	newSnap := cluster.Snapshot()
 	newSubLb := newSnap.LoadBalancer().(*subsetLoadBalancer)
 	// verify
-	if len(newSubLb.fallbackSubset.hostSet.Hosts()) != 60 {
+	if newSubLb.fallbackSubset.HostNum() != 60 {
 		t.Fatal("default fallback should be all hosts")
 	}
 	newResult := &subSetMapResult{
@@ -116,7 +148,7 @@ func TestUpdateHostLabels(t *testing.T) {
 			"version": "1",
 		},
 	}
-	cluster.UpdateHosts([]types.Host{host})
+	cluster.UpdateHosts(NewHostSet([]types.Host{host}))
 	snap := cluster.Snapshot()
 	subLb := snap.LoadBalancer().(*subsetLoadBalancer)
 	result := &subSetMapResult{
@@ -143,7 +175,7 @@ func TestUpdateHostLabels(t *testing.T) {
 			"version": "2",
 		},
 	}
-	cluster.UpdateHosts([]types.Host{newHost})
+	cluster.UpdateHosts(NewHostSet([]types.Host{newHost}))
 	newSnap := cluster.Snapshot()
 	newSubLb := newSnap.LoadBalancer().(*subsetLoadBalancer)
 	newResult := &subSetMapResult{
@@ -162,5 +194,54 @@ func TestUpdateHostLabels(t *testing.T) {
 		if !ok || len(sub) != count {
 			t.Fatalf("%s is not expected, exists: %v, count: %d", p, ok, len(sub))
 		}
+	}
+}
+
+func TestClusterUseClusterManagerTLS(t *testing.T) {
+	clusterManagerInstance.Destroy()
+	NewClusterManagerSingleton(nil, nil, nil)
+	clusterConfig := v2.Cluster{
+		Name:              "test_cluster",
+		LbType:            v2.LB_RANDOM,
+		ClusterManagerTLS: true,
+	}
+	c := NewCluster(clusterConfig)
+	snap := c.Snapshot()
+	if mng := snap.ClusterInfo().TLSMng(); mng.Enabled() {
+		t.Fatal("tls should not enabled")
+	}
+	// update tls mananger
+	clusterManagerInstance.UpdateTLSManager(&v2.TLSConfig{
+		Status:       true,
+		InsecureSkip: true,
+	})
+	if mng := snap.ClusterInfo().TLSMng(); !mng.Enabled() {
+		t.Fatal("tls should enabled")
+	}
+	// config without manager tls
+	clusterConfig2 := v2.Cluster{
+		Name:   "test_cluster",
+		LbType: v2.LB_RANDOM,
+	}
+	c2 := NewCluster(clusterConfig2)
+	if mng := c2.Snapshot().ClusterInfo().TLSMng(); mng.Enabled() {
+		t.Fatal("tls should not enabled")
+	}
+
+}
+
+func TestClusterTypeCompatible(t *testing.T) {
+	// keep static/dynamic/eds as simple
+	for _, typ := range []v2.ClusterType{
+		v2.EDS_CLUSTER,
+		v2.STATIC_CLUSTER,
+		v2.DYNAMIC_CLUSTER,
+	} {
+		cfg := v2.Cluster{
+			Name:        "test",
+			ClusterType: typ,
+		}
+		c := NewCluster(cfg)
+		require.Equal(t, v2.SIMPLE_CLUSTER, c.Snapshot().ClusterInfo().ClusterType())
 	}
 }

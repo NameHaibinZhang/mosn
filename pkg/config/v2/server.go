@@ -19,7 +19,9 @@ package v2
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
+	"strings"
 
 	"mosn.io/api"
 )
@@ -35,9 +37,9 @@ type ServerConfig struct {
 	UseNetpollMode bool `json:"use_netpoll_mode,omitempty"`
 	//graceful shutdown config
 	GracefulTimeout api.DurationConfig `json:"graceful_timeout,omitempty"`
-
-	//go processor number
-	Processor int `json:"processor,omitempty"`
+	// int go processor number
+	// string set auto means use real cpu core or limit cpu core
+	Processor interface{} `json:"processor,omitempty"`
 
 	Listeners []Listener `json:"listeners,omitempty"`
 
@@ -50,29 +52,40 @@ type ListenerType string
 const EGRESS ListenerType = "egress"
 const INGRESS ListenerType = "ingress"
 
+// OriginalDstType: TProxy or Redirect
+type OriginalDstType string
+
+const TPROXY OriginalDstType = "tproxy"
+const REDIRECT OriginalDstType = "redirect"
+
 type ListenerConfig struct {
-	Name                  string              `json:"name,omitempty"`
-	Type                  ListenerType        `json:"type,omitempty"`
-	AddrConfig            string              `json:"address,omitempty"`
-	BindToPort            bool                `json:"bind_port,omitempty"`
-	UseOriginalDst        bool                `json:"use_original_dst,omitempty"`
+	Name       string       `json:"name,omitempty"`
+	Type       ListenerType `json:"type,omitempty"`
+	AddrConfig string       `json:"address,omitempty"`
+	BindToPort bool         `json:"bind_port,omitempty"`
+	// recommended to use in UDP bidirectional data transmission scenarios.
+	ReusePort             bool                `json:"reuseport,omitempty"`
+	Network               string              `json:"network,omitempty"`
+	OriginalDst           OriginalDstType     `json:"use_original_dst,omitempty"`
 	AccessLogs            []AccessLog         `json:"access_logs,omitempty"`
 	ListenerFilters       []Filter            `json:"listener_filters,omitempty"`
 	FilterChains          []FilterChain       `json:"filter_chains,omitempty"` // only one filterchains at this time
 	StreamFilters         []Filter            `json:"stream_filters,omitempty"`
 	Inspector             bool                `json:"inspector,omitempty"`
 	ConnectionIdleTimeout *api.DurationConfig `json:"connection_idle_timeout,omitempty"`
+	DefaultReadBufferSize int                 `json:"default_read_buffer_size,omitempty"`
 }
 
 // Listener contains the listener's information
 type Listener struct {
 	ListenerConfig
-	Addr                    net.Addr         `json:"-"`
-	ListenerTag             uint64           `json:"-"`
-	ListenerScope           string           `json:"-"`
-	PerConnBufferLimitBytes uint32           `json:"-"` // do not support config
-	InheritListener         *net.TCPListener `json:"-"`
-	Remain                  bool             `json:"-"`
+	Addr                    net.Addr        `json:"-"`
+	ListenerTag             uint64          `json:"-"`
+	ListenerScope           string          `json:"-"`
+	PerConnBufferLimitBytes uint32          `json:"-"` // do not support config
+	InheritListener         net.Listener    `json:"-"`
+	InheritPacketConn       *net.PacketConn `json:"-"`
+	Remain                  bool            `json:"-"`
 }
 
 func (l Listener) MarshalJSON() (b []byte, err error) {
@@ -80,6 +93,51 @@ func (l Listener) MarshalJSON() (b []byte, err error) {
 		l.AddrConfig = l.Addr.String()
 	}
 	return json.Marshal(l.ListenerConfig)
+}
+
+var (
+	ErrNoAddrListener   = errors.New("address is required in listener config")
+	ErrUnsupportNetwork = errors.New("listener network only support tcp/udp/unix")
+)
+
+const defaultBufferLimit = 1 << 15
+
+func (l *Listener) UnmarshalJSON(b []byte) error {
+	if err := json.Unmarshal(b, &l.ListenerConfig); err != nil {
+		return err
+	}
+	if l.AddrConfig == "" {
+		return ErrNoAddrListener
+	}
+	if l.Network == "" {
+		l.Network = "tcp" // default is tcp
+	}
+	l.Network = strings.ToLower(l.Network)
+	var err error
+	var addr net.Addr
+	switch l.Network {
+	case "udp":
+		addr, err = net.ResolveUDPAddr("udp", l.AddrConfig)
+	case "unix":
+		addr, err = net.ResolveUnixAddr("unix", l.AddrConfig)
+	case "tcp":
+		addr, err = net.ResolveTCPAddr("tcp", l.AddrConfig)
+	default: // only support tcp,udp,unix
+		err = ErrUnsupportNetwork
+	}
+	if err != nil {
+		return err
+	}
+	l.Addr = addr
+	l.PerConnBufferLimitBytes = defaultBufferLimit
+	return nil
+}
+
+func (l *Listener) IsOriginalDst() bool {
+	if l.OriginalDst == TPROXY || l.OriginalDst == REDIRECT {
+		return true
+	}
+	return false
 }
 
 // AccessLog for making up access log
@@ -123,10 +181,16 @@ func (fc *FilterChain) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+type StreamFilterGoPluginConfig struct {
+	SoPath        string `json:"so_path"`
+	FactoryMethod string `json:"factory_method"`
+}
+
 // Filter is a config to make up a filter
 type Filter struct {
-	Type   string                 `json:"type,omitempty"`
-	Config map[string]interface{} `json:"config,omitempty"`
+	Type           string                      `json:"type,omitempty"`
+	GoPluginConfig *StreamFilterGoPluginConfig `json:"go_plugin_config"`
+	Config         map[string]interface{}      `json:"config,omitempty"`
 }
 
 type FilterChainConfig struct {

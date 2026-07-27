@@ -1,3 +1,20 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package payloadlimit
 
 import (
@@ -6,7 +23,7 @@ import (
 	"encoding/json"
 
 	"mosn.io/api"
-	"mosn.io/mosn/pkg/config/v2"
+	v2 "mosn.io/mosn/pkg/config/v2"
 	"mosn.io/mosn/pkg/log"
 	"mosn.io/pkg/buffer"
 )
@@ -64,7 +81,9 @@ func (f *streamPayloadLimitFilter) ReadPerRouteConfig(cfg map[string]interface{}
 	}
 	if payloadLimit, ok := cfg[v2.PayloadLimit]; ok {
 		if config, ok := parseStreamPayloadLimitConfig(payloadLimit); ok {
-			log.DefaultLogger.Errorf("use router config to replace stream filter config, config: %v", payloadLimit)
+			if log.DefaultLogger.GetLogLevel() >= log.INFO {
+				log.DefaultLogger.Infof("use router config to replace stream filter config, config: %v", payloadLimit)
+			}
 			f.config = config
 		}
 	}

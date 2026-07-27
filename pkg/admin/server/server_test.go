@@ -19,23 +19,26 @@ package server
 
 import (
 	"bufio"
-	rawjson "encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"os"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
-	v2 "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v2"
+	rawjson "encoding/json"
+
 	"mosn.io/mosn/pkg/admin/store"
-	mv2 "mosn.io/mosn/pkg/config/v2"
+	v2 "mosn.io/mosn/pkg/config/v2"
+	"mosn.io/mosn/pkg/configmanager"
 	"mosn.io/mosn/pkg/log"
 	"mosn.io/mosn/pkg/metrics"
+	"mosn.io/mosn/pkg/stagemanager"
 )
 
 func getEffectiveConfig(port uint32) (string, error) {
@@ -74,6 +77,39 @@ func getStats(port uint32) (string, error) {
 	return string(b), nil
 }
 
+func getGlobalStats(port uint32) (string, error) {
+	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/api/v1/stats_glob", port))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	b, err := ioutil.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", errors.New(fmt.Sprintf("call admin api failed response status: %d, %s", resp.StatusCode, string(b)))
+	}
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func getLoggerLevel() ([]byte, error) {
+	url := "http://localhost:8889/api/v1/get_loglevel"
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	err = errors.New("get logger info failed")
+	if resp.StatusCode != http.StatusOK {
+		return nil, err
+	}
+	b, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
+}
 func postUpdateLoggerLevel(port uint32, s string) (string, error) {
 	data := strings.NewReader(s)
 	url := fmt.Sprintf("http://localhost:%d/api/v1/update_loglevel", port)
@@ -96,7 +132,7 @@ func postUpdateLoggerLevel(port uint32, s string) (string, error) {
 func postToggleLogger(port uint32, logger string, disable bool) (string, error) {
 	api := "enable_log" // enable
 	if disable {        //disable
-		api = "disbale_log"
+		api = "disable_log"
 	}
 	url := fmt.Sprintf("http://localhost:%d/api/v1/%s", port, api)
 	data := strings.NewReader(logger)
@@ -117,7 +153,7 @@ func postToggleLogger(port uint32, logger string, disable bool) (string, error) 
 
 }
 
-func getMosnState(port uint32) (pid int, state store.State, err error) {
+func getMosnState(port uint32) (pid int, state stagemanager.State, err error) {
 	url := fmt.Sprintf("http://localhost:%d/api/v1/states", port)
 	resp, err := http.Get(url)
 	if err != nil {
@@ -137,28 +173,21 @@ func getMosnState(port uint32) (pid int, state store.State, err error) {
 	stateStr := strings.Split(p[1], "=")[1]
 	pid, _ = strconv.Atoi(pidStr)
 	stateInt, _ := strconv.Atoi(stateStr)
-	state = store.State(stateInt)
+	state = stagemanager.State(stateInt)
 	return pid, state, nil
 }
 
 type mockMOSNConfig struct {
-	Name string `json:"name"`
-	Port uint32 `json:"port"`
+	Address string `json:"addr"`
+	Port    uint32 `json:"port"`
 }
 
 func (m *mockMOSNConfig) GetAdmin() *v2.Admin {
 	return &v2.Admin{
-		Address: &core.Address{
-			Address: &core.Address_SocketAddress{
-				SocketAddress: &core.SocketAddress{
-					Protocol: 0,
-					Address:  "",
-					PortSpecifier: &core.SocketAddress_PortValue{
-						PortValue: m.Port,
-					},
-					ResolverName: "",
-					Ipv4Compat:   false,
-				},
+		Address: &v2.AddressInfo{
+			SocketAddress: v2.SocketAddress{
+				Address:   m.Address,
+				PortValue: m.Port,
 			},
 		},
 	}
@@ -168,20 +197,21 @@ func TestDumpConfig(t *testing.T) {
 	time.Sleep(time.Second)
 	server := Server{}
 	config := &mockMOSNConfig{
-		Name: "mock",
-		Port: 8889,
+		Address: "127.0.0.1",
+		Port:    8889,
 	}
 	server.Start(config)
 	store.StartService(nil)
 	defer store.StopService()
 
-	mcfg := &mv2.MOSNConfig{
-		Tracing: mv2.TracingConfig{
+	mcfg := &v2.MOSNConfig{
+		Tracing: v2.TracingConfig{
 			Enable: true,
 			Driver: "test",
 		},
 	}
-	store.SetMosnConfig(mcfg)
+	configmanager.SetMosnConfig(mcfg)
+	defer configmanager.Reset()
 
 	time.Sleep(time.Second) //wait server start
 
@@ -192,15 +222,14 @@ func TestDumpConfig(t *testing.T) {
 			t.Errorf("unexpected effectiveConfig: %s\n", data)
 		}
 	}
-	store.Reset()
 }
 
 func TestDumpStats(t *testing.T) {
 	time.Sleep(time.Second)
 	server := Server{}
 	config := &mockMOSNConfig{
-		Name: "mock",
-		Port: 8889,
+		Address: "127.0.0.1",
+		Port:    8889,
 	}
 	server.Start(config)
 	store.StartService(nil)
@@ -225,18 +254,64 @@ func TestDumpStats(t *testing.T) {
 		t.Error(err)
 	} else {
 		if data != string(expected) {
+			t.Errorf("unexpected stats: %s, expected: %s\n", data, string(expected))
+		}
+	}
+
+	stats1, _ := metrics.NewMetrics("downstream", map[string]string{"proxy": "global"})
+	stats1.Counter("ct1").Inc(1)
+	stats1.Gauge("gg2").Update(3)
+	expected_string := "ct1:1\ngg2:3\n"
+	if data, err := getGlobalStats(config.Port); err != nil {
+		t.Error(err)
+	} else {
+		want := strings.Split(expected_string, "\n")
+		got := strings.Split(data, "\n")
+		sort.Strings(want)
+		sort.Strings(got)
+		if !reflect.DeepEqual(got, want) {
 			t.Errorf("unexpected stats: %s\n", data)
 		}
 	}
-	store.Reset()
+
+	configmanager.Reset()
+}
+
+func TestGetLogger(t *testing.T) {
+	time.Sleep(time.Second)
+	server := Server{}
+	config := &mockMOSNConfig{
+		Address: "127.0.0.1",
+		Port:    8889,
+	}
+	server.Start(config)
+	store.StartService(nil)
+	defer store.StopService()
+
+	time.Sleep(time.Second) //wait server start
+
+	logName := "/tmp/mosn_admin/test_admin.log"
+	_, err := log.GetOrCreateDefaultErrorLogger(logName, log.INFO)
+	if err != nil {
+		t.Fatal("create logger failed")
+	}
+	logInfo, err := getLoggerLevel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loggerMap := make(map[string]string)
+	json.Unmarshal(logInfo, &loggerMap)
+	if loggerMap[logName] != "INFO" {
+		t.Errorf("fail to get logger info, %+v", loggerMap)
+	}
 }
 
 func TestUpdateLogger(t *testing.T) {
 	time.Sleep(time.Second)
 	server := Server{}
 	config := &mockMOSNConfig{
-		Name: "mock",
-		Port: 8889,
+		Address: "127.0.0.1",
+		Port:    8889,
 	}
 	server.Start(config)
 	store.StartService(nil)
@@ -249,6 +324,16 @@ func TestUpdateLogger(t *testing.T) {
 	if err != nil {
 		t.Fatal("create logger failed")
 	}
+	logInfo, err := getLoggerLevel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loggerMap := make(map[string]string)
+	json.Unmarshal(logInfo, &loggerMap)
+	if loggerMap[logName] != "INFO" {
+		t.Errorf("fail to get logger info, %+v", loggerMap)
+	}
+
 	// update logger
 	postData := `{
 		"log_path": "/tmp/mosn_admin/test_admin.log",
@@ -260,14 +345,23 @@ func TestUpdateLogger(t *testing.T) {
 	if logger.GetLogLevel() != log.ERROR {
 		t.Errorf("update logger success, but logger level is not expected: %v", logger.GetLogLevel())
 	}
+	logInfo, err = getLoggerLevel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loggerMap = make(map[string]string)
+	json.Unmarshal(logInfo, &loggerMap)
+	if loggerMap[logName] != "ERROR" {
+		t.Errorf("fail to change logger level, %+v", loggerMap)
+	}
 }
 
 func TestToggleLogger(t *testing.T) {
 	time.Sleep(time.Second)
 	server := Server{}
 	config := &mockMOSNConfig{
-		Name: "mock",
-		Port: 8889,
+		Address: "127.0.0.1",
+		Port:    8889,
 	}
 	server.Start(config)
 	store.StartService(nil)
@@ -315,8 +409,8 @@ func TestGetState(t *testing.T) {
 	time.Sleep(time.Second)
 	server := Server{}
 	config := &mockMOSNConfig{
-		Name: "mock",
-		Port: 8889,
+		Address: "127.0.0.1",
+		Port:    8889,
 	}
 	server.Start(config)
 	store.StartService(nil)
@@ -324,34 +418,47 @@ func TestGetState(t *testing.T) {
 
 	time.Sleep(time.Second) //wait server start
 
-	// init
-	pid, state, err := getMosnState(config.Port)
-	if err != nil {
-		t.Fatal("get mosn states failed")
+	verifyState := func(expectedState stagemanager.State, expectedPid int) {
+		pid, state, err := getMosnState(config.Port)
+		if err != nil {
+			t.Fatalf("get mosn states failed: %v", err)
+		}
+
+		// verify
+		if pid != expectedPid {
+			t.Error("mosn pid is not expected", pid, expectedPid)
+		}
+		if state != expectedState {
+			t.Error("mosn state is not expected", state, expectedState)
+		}
 	}
-	// reconfiguring
-	store.SetMosnState(store.Passive_Reconfiguring)
-	pid2, state2, err := getMosnState(config.Port)
-	if err != nil {
-		t.Fatal("get mosn states failed")
+
+	allStates := []stagemanager.State{
+		stagemanager.Nil,
+		stagemanager.ParamsParsed,
+		stagemanager.Initing,
+		stagemanager.PreStart,
+		stagemanager.Starting,
+		stagemanager.AfterStart,
+		stagemanager.Running,
+		stagemanager.GracefulStopping,
+		stagemanager.Stopping,
+		stagemanager.AfterStop,
+		stagemanager.Stopped,
+		stagemanager.StartingNewServer,
+		stagemanager.Upgrading,
 	}
-	// running
-	store.SetMosnState(store.Running)
-	pid3, state3, err := getMosnState(config.Port)
-	if err != nil {
-		t.Fatal("get mosn states failed")
-	}
-	// verify
+
 	curPid := os.Getpid()
-	if !(pid == curPid &&
-		pid2 == curPid &&
-		pid3 == curPid) {
-		t.Error("mosn pid is not expected", pid, pid2, pid3)
-	}
-	if !(state == store.Init &&
-		state2 == store.Passive_Reconfiguring &&
-		state3 == store.Running) {
-		t.Error("mosn state is not expected", state, state2, state3)
+
+	// verify init
+	verifyState(stagemanager.Nil, curPid)
+
+	// verify set state
+	stm := stagemanager.InitStageManager(nil, "", nil)
+	for _, state := range allStates {
+		stm.SetState(state)
+		verifyState(state, curPid)
 	}
 }
 
@@ -366,8 +473,8 @@ func TestRegisterNewAPI(t *testing.T) {
 	time.Sleep(time.Second)
 	server := Server{}
 	config := &mockMOSNConfig{
-		Name: "mock",
-		Port: 8889,
+		Address: "127.0.0.1",
+		Port:    8889,
 	}
 	server.Start(config)
 	store.StartService(nil)
@@ -385,23 +492,70 @@ func TestRegisterNewAPI(t *testing.T) {
 	}
 }
 
+func TestRegisterAPIHandler(t *testing.T) {
+	handler := NewAPIHandler(func(w http.ResponseWriter, r *http.Request) {
+	}, NewAuth(func(r *http.Request) bool {
+		return r.FormValue("pass") == "true"
+	}, nil))
+	pattern := "/api/handler/auth"
+	RegisterAdminHandler(pattern, handler)
+	//
+	time.Sleep(time.Second)
+	server := Server{}
+	config := &mockMOSNConfig{
+		Address: "127.0.0.1",
+		Port:    8889,
+	}
+	server.Start(config)
+	store.StartService(nil)
+	defer store.StopService()
+
+	time.Sleep(time.Second) //wait server start
+	t.Run("request success", func(t *testing.T) {
+		url := fmt.Sprintf("http://localhost:%d%s?pass=true", config.Port, pattern)
+		resp, err := http.Get(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("unexpected status code: %d", resp.StatusCode)
+		}
+	})
+	t.Run("request failed", func(t *testing.T) {
+		url := fmt.Sprintf("http://localhost:%d%s", config.Port, pattern)
+		resp, err := http.Get(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("unexpected status code: %d", resp.StatusCode)
+		}
+	})
+}
+
 func TestHelpAPI(t *testing.T) {
 	// reset
-	apiHandleFuncStore = map[string]func(http.ResponseWriter, *http.Request){
-		"/":                       help,
-		"/api/v1/config_dump":     configDump,
-		"/api/v1/stats":           statsDump,
-		"/api/v1/update_loglevel": updateLogLevel,
-		"/api/v1/enable_log":      enableLogger,
-		"/api/v1/disbale_log":     disableLogger,
-		"/api/v1/states":          getState,
+	apiHandlerStore = map[string]*APIHandler{
+		"/api/v1/test_deleted":    NewAPIHandler(ConfigDump), // will be deleted
+		"/api/v1/config_dump":     NewAPIHandler(ConfigDump),
+		"/api/v1/stats":           NewAPIHandler(StatsDump),
+		"/api/v1/update_loglevel": NewAPIHandler(UpdateLogLevel),
+		"/api/v1/get_loglevel":    NewAPIHandler(GetLoggerInfo),
+		"/api/v1/enable_log":      NewAPIHandler(EnableLogger),
+		"/api/v1/disable_log":     NewAPIHandler(DisableLogger),
+		"/api/v1/states":          NewAPIHandler(GetState),
+		"/":                       NewAPIHandler(Help),
 	}
 	time.Sleep(time.Second)
 	server := Server{}
 	config := &mockMOSNConfig{
-		Name: "mock",
-		Port: 8889,
+		Address: "127.0.0.1",
+		Port:    8889,
 	}
+	// delete
+	DeleteRegisteredAdminHandler("/api/v1/test_deleted")
 	server.Start(config)
 	store.StartService(nil)
 	defer store.StopService()
@@ -426,8 +580,8 @@ func TestHelpAPI(t *testing.T) {
 	for _, addr := range []string{"/", "/not_exists"} {
 		s := query(t, addr)
 		s = strings.TrimSuffix(s, "\n")
-		apis := strings.Split(s, "\n")[1:] // the first line is "support apis:"
-		if len(apis) != 6 {                // exclued "/"
+		apis := strings.Split(s, "\n")[1:] // the first line is "supported APIs:"
+		if len(apis) != 7 {                // exclued "/"
 			t.Errorf("apis count is not expected: %v, length is %d", apis, len(apis))
 		}
 	}

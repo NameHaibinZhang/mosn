@@ -7,17 +7,18 @@ import (
 	"testing"
 	"time"
 
-	"mosn.io/mosn/pkg/mosn"
-	"mosn.io/mosn/pkg/protocol/xprotocol"
+	"mosn.io/api"
+
 	"mosn.io/mosn/pkg/protocol/xprotocol/bolt"
 	"mosn.io/mosn/pkg/types"
 	"mosn.io/mosn/test/util"
+	"mosn.io/mosn/test/util/mosn"
 )
 
 type heartBeatServer struct {
 	util.UpstreamServer
 	HeartBeatCount uint32
-	boltProto      xprotocol.XProtocol
+	boltProto      api.XProtocol
 }
 
 func (s *heartBeatServer) ServeBoltOrHeartbeat(t *testing.T, conn net.Conn) {
@@ -31,7 +32,7 @@ func (s *heartBeatServer) ServeBoltOrHeartbeat(t *testing.T, conn net.Conn) {
 			var err error
 			switch req.CmdCode {
 			case bolt.CmdCodeHeartbeat:
-				hbAck := s.boltProto.Reply(uint64(req.RequestId))
+				hbAck := s.boltProto.Reply(context.TODO(), req)
 				iobufresp, err = s.boltProto.Encode(context.Background(), hbAck)
 				atomic.AddUint32(&s.HeartBeatCount, 1)
 			case bolt.CmdCodeRpcRequest:
@@ -54,7 +55,7 @@ func TestKeepAlive(t *testing.T) {
 	appAddr := "127.0.0.1:8080"
 	server := &heartBeatServer{}
 	server.UpstreamServer = util.NewUpstreamServer(t, appAddr, server.ServeBoltOrHeartbeat)
-	server.boltProto = xprotocol.GetProtocol(bolt.ProtocolName)
+	server.boltProto = (&bolt.XCodec{}).NewXProtocol(context.Background())
 	server.GoServe()
 	clientMeshAddr := util.CurrentMeshAddr()
 	cfg := util.CreateXProtocolProxyMesh(clientMeshAddr, []string{appAddr}, bolt.ProtocolName)

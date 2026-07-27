@@ -21,9 +21,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
+
+	"mosn.io/api"
 
 	"mosn.io/mosn/pkg/log"
-	"mosn.io/mosn/pkg/protocol/xprotocol"
 	"mosn.io/mosn/pkg/types"
 )
 
@@ -41,18 +43,14 @@ import (
  * +-----------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
  */
 
-func init() {
-	xprotocol.RegisterProtocol(ProtocolName, &proto{})
-}
-
 type proto struct{}
 
 // types.Protocol
-func (proto *proto) Name() types.ProtocolName {
+func (proto proto) Name() types.ProtocolName {
 	return ProtocolName
 }
 
-func (proto *proto) Encode(ctx context.Context, model interface{}) (types.IoBuffer, error) {
+func (proto proto) Encode(ctx context.Context, model interface{}) (types.IoBuffer, error) {
 	switch frame := model.(type) {
 	case *Request:
 		return encodeRequest(ctx, frame)
@@ -64,7 +62,7 @@ func (proto *proto) Encode(ctx context.Context, model interface{}) (types.IoBuff
 	}
 }
 
-func (proto *proto) Decode(ctx context.Context, data types.IoBuffer) (interface{}, error) {
+func (proto proto) Decode(ctx context.Context, data types.IoBuffer) (interface{}, error) {
 	if data.Len() >= MinimalDecodeLen {
 		magic := data.Bytes()[0]
 		dir := data.Bytes()[2]
@@ -89,30 +87,50 @@ func (proto *proto) Decode(ctx context.Context, data types.IoBuffer) (interface{
 	return nil, nil
 }
 
-func NewCodec() types.Protocol {
+func NewCodec() api.Protocol {
 	return &proto{}
 }
 
 // TODOs
 
 // Heartbeater
-func (proto *proto) Trigger(requestId uint64) xprotocol.XFrame {
+func (proto proto) Trigger(ctx context.Context, requestId uint64) api.XFrame {
 	// not supported for poc demo
 	return nil
 }
 
-func (proto *proto) Reply(requestId uint64) xprotocol.XRespFrame {
+func (proto proto) Reply(ctx context.Context, request api.XFrame) api.XRespFrame {
 	// not supported for poc demo
 	return nil
+}
+
+func (proto proto) GoAway(ctx context.Context) api.XFrame {
+	return &Request{
+		Type: TypeGoAway,
+	}
 }
 
 // Hijacker
-func (proto *proto) Hijack(statusCode uint32) xprotocol.XRespFrame {
+func (proto proto) Hijack(ctx context.Context, request api.XFrame, statusCode uint32) api.XRespFrame {
 	// not supported for poc demo
 	return nil
 }
 
-func (proto *proto) Mapping(httpStatusCode uint32) uint32 {
+func (proto proto) Mapping(httpStatusCode uint32) uint32 {
 	// not supported for poc demo
 	return 0
+}
+
+// PoolMode returns whether pingpong or multiplex
+func (proto proto) PoolMode() api.PoolMode {
+	return api.Multiplex
+}
+
+func (proto proto) EnableWorkerPool() bool {
+	return true
+}
+
+func (proto proto) GenerateRequestID(streamID *uint64) uint64 {
+	// fix bug for issue: https://github.com/mosn/mosn/issues/2403
+	return uint64(uint32(atomic.AddUint64(streamID, 1)))
 }

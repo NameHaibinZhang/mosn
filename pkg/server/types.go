@@ -20,7 +20,7 @@ package server
 import (
 	"time"
 
-	"mosn.io/mosn/pkg/config/v2"
+	v2 "mosn.io/mosn/pkg/config/v2"
 	"mosn.io/mosn/pkg/log"
 	"mosn.io/mosn/pkg/types"
 )
@@ -31,16 +31,18 @@ type Config struct {
 	LogLevel        log.Level
 	LogRoller       string
 	GracefulTimeout time.Duration
-	Processor       int
 	UseNetpollMode  bool
 }
 
 type Server interface {
-	AddListener(lc *v2.Listener, updateListenerFilter bool, updateNetworkFilter bool, updateStreamFilter bool) (types.ListenerEventListener, error)
+	AddListener(lc *v2.Listener) (types.ListenerEventListener, error)
 
 	Start()
 
 	Restart()
+
+	// Shutdown means graceful stop
+	Shutdown() error
 
 	Close()
 
